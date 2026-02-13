@@ -22,7 +22,9 @@ function deriveInitialState(providerConfig = {}) {
         }
     }
 
-    if (providerConfig.isHealthy === false) return LIFECYCLE_STATE.QUARANTINED;
+    // ProviderPool liveness (isHealthy) is not a "risk quarantine" signal.
+    // Keep risk lifecycle separate from transient health failures to avoid false blocking.
+    if (providerConfig.isHealthy === false) return LIFECYCLE_STATE.UNKNOWN;
     return LIFECYCLE_STATE.HEALTHY;
 }
 
@@ -75,15 +77,20 @@ export class LifecycleStore {
                 if (!provider?.uuid) continue;
                 const key = toCredentialId(providerType, provider.uuid);
                 const existing = this.credentials.get(key);
-                const state = deriveInitialState(provider);
+                const derivedState = deriveInitialState(provider);
                 const now = nowIso();
+                const existingState = existing?.lifecycleState || null;
+                const lifecycleState =
+                    existingState === LIFECYCLE_STATE.BANNED || existingState === LIFECYCLE_STATE.SUSPENDED
+                        ? existingState
+                        : derivedState;
 
                 const merged = {
                     credentialId: key,
                     providerType,
                     uuid: provider.uuid,
                     customName: provider.customName || null,
-                    lifecycleState: existing?.lifecycleState || state,
+                    lifecycleState,
                     cooldownUntil: provider.scheduledRecoveryTime || existing?.cooldownUntil || null,
                     lastSignalType: existing?.lastSignalType || null,
                     lastReasonCode: existing?.lastReasonCode || null,

@@ -908,17 +908,48 @@ async saveCredentialsToFile(filePath, newData) {
      * @param {Function} saveCredentialsToFile - 保存凭证的函数
      * @param {string} tokenFilePath - 凭证文件路径
      */
-    async _doTokenRefresh(saveCredentialsToFile, tokenFilePath) {
-        const maxRetries = Number.isFinite(Number(this.config?.KIRO_TOKEN_REFRESH_MAX_RETRIES))
-            ? Math.max(0, Number(this.config.KIRO_TOKEN_REFRESH_MAX_RETRIES))
-            : 2;
-        const baseDelayMs = Number.isFinite(Number(this.config?.KIRO_TOKEN_REFRESH_RETRY_BASE_DELAY_MS))
-            ? Math.max(0, Number(this.config.KIRO_TOKEN_REFRESH_RETRY_BASE_DELAY_MS))
-            : 500;
+	    async _doTokenRefresh(saveCredentialsToFile, tokenFilePath) {
+	        const maxRetries = Number.isFinite(Number(this.config?.KIRO_TOKEN_REFRESH_MAX_RETRIES))
+	            ? Math.max(0, Number(this.config.KIRO_TOKEN_REFRESH_MAX_RETRIES))
+	            : 2;
+	        const baseDelayMs = Number.isFinite(Number(this.config?.KIRO_TOKEN_REFRESH_RETRY_BASE_DELAY_MS))
+	            ? Math.max(0, Number(this.config.KIRO_TOKEN_REFRESH_RETRY_BASE_DELAY_MS))
+	            : 500;
 
-        let lastError = null;
-        for (let attempt = 0; attempt <= maxRetries; attempt++) {
-            try {
+	        const summarizeAxiosError = (error) => {
+	            const status = error?.response?.status ?? null;
+	            const statusText = typeof error?.response?.statusText === 'string' ? error.response.statusText : null;
+	            const headers = error?.response?.headers || null;
+	            const data = error?.response?.data;
+
+	            const summary = {
+	                status,
+	                statusText,
+	                errorType: headers?.['x-amzn-errortype'] || headers?.['x-amz-errortype'] || null
+	            };
+
+	            if (data && typeof data === 'object' && !Array.isArray(data)) {
+	                // Keep only a few safe, high-signal fields (never log tokens/secrets).
+	                const allow = ['error', 'error_description', 'message', 'Message', '__type', 'code'];
+	                summary.data = {};
+	                for (const key of allow) {
+	                    if (Object.prototype.hasOwnProperty.call(data, key) && data[key] !== undefined && data[key] !== null) {
+	                        summary.data[key] = String(data[key]).slice(0, 500);
+	                    }
+	                }
+	                if (Object.keys(summary.data).length === 0) {
+	                    delete summary.data;
+	                }
+	            } else if (typeof data === 'string' && data.trim()) {
+	                summary.dataText = data.slice(0, 500);
+	            }
+
+	            return summary;
+	        };
+
+	        let lastError = null;
+	        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+	            try {
                 if (attempt === 0) {
                     logger.info('[Kiro Auth] Refresh request meta', {
                         uuid: this.uuid || null,
@@ -950,24 +981,37 @@ async saveCredentialsToFile(filePath, newData) {
                     logger.info('[Kiro Auth] Token refresh idc response: ok');
                 }
 
-                if (response.data && response.data.accessToken) {
-                    this.accessToken = response.data.accessToken;
-                    this.refreshToken = response.data.refreshToken;
-                    this.profileArn = response.data.profileArn;
-                    const expiresIn = response.data.expiresIn;
-                    const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
-                    this.expiresAt = expiresAt;
-                    logger.info('[Kiro Auth] Access token refreshed successfully');
+	                if (response.data && response.data.accessToken) {
+	                    const rotatedRefreshToken = response.data.refreshToken;
+	                    const effectiveRefreshToken =
+	                        typeof rotatedRefreshToken === 'string' && rotatedRefreshToken.trim()
+	                            ? rotatedRefreshToken
+	                            : this.refreshToken;
 
-                    const updatedTokenData = {
-                        accessToken: this.accessToken,
-                        refreshToken: this.refreshToken,
-                        expiresAt: expiresAt,
-                    };
-                    if (this.profileArn) {
-                        updatedTokenData.profileArn = this.profileArn;
-                    }
-                    await saveCredentialsToFile(tokenFilePath, updatedTokenData);
+	                    this.accessToken = response.data.accessToken;
+	                    // Some refresh endpoints do not rotate refreshToken on every refresh.
+	                    // Never clobber an existing refreshToken with undefined/null.
+	                    if (effectiveRefreshToken) {
+	                        this.refreshToken = effectiveRefreshToken;
+	                    }
+	                    this.profileArn = response.data.profileArn || this.profileArn;
+	                    const expiresInRaw = response.data.expiresIn ?? response.data.expires_in ?? 3600;
+	                    const expiresIn = Number.isFinite(Number(expiresInRaw)) ? Number(expiresInRaw) : 3600;
+	                    const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
+	                    this.expiresAt = expiresAt;
+	                    logger.info('[Kiro Auth] Access token refreshed successfully');
+
+	                    const updatedTokenData = {
+	                        accessToken: this.accessToken,
+	                        expiresAt
+	                    };
+	                    if (this.refreshToken) {
+	                        updatedTokenData.refreshToken = this.refreshToken;
+	                    }
+	                    if (this.profileArn) {
+	                        updatedTokenData.profileArn = this.profileArn;
+	                    }
+	                    await saveCredentialsToFile(tokenFilePath, updatedTokenData);
 
                     // Best-effort: resolve and persist stable identity (e.g. d-... userId) after refresh.
                     try {
@@ -985,15 +1029,26 @@ async saveCredentialsToFile(filePath, newData) {
                 }
 
                 throw new Error('Invalid refresh response: Missing accessToken');
-            } catch (error) {
-                lastError = error;
+	            } catch (error) {
+	                lastError = error;
 
-                const retryable = isRetryableNetworkError(error);
-                const shouldRetry = retryable && attempt < maxRetries;
-                if (!shouldRetry) {
-                    logger.error('[Kiro Auth] Token refresh failed:', error.message);
-                    throw new Error(`Token refresh failed: ${error.message}`);
-                }
+	                const retryable = isRetryableNetworkError(error);
+	                const shouldRetry = retryable && attempt < maxRetries;
+	                if (!shouldRetry) {
+	                    const axiosSummary = summarizeAxiosError(error);
+	                    if (axiosSummary?.status) {
+	                        logger.error('[Kiro Auth] Token refresh error details', {
+	                            uuid: this.uuid || null,
+	                            authMethod: this.authMethod || null,
+	                            proxy: this._getProxyMetaForLogs(),
+	                            ...axiosSummary
+	                        });
+	                    }
+	                }
+	                if (!shouldRetry) {
+	                    logger.error('[Kiro Auth] Token refresh failed:', error.message);
+	                    throw new Error(`Token refresh failed: ${error.message}`);
+	                }
 
                 const delayMs = baseDelayMs * (attempt + 1);
                 logger.warn(`[Kiro Auth] Token refresh attempt ${attempt + 1}/${maxRetries + 1} failed: ${error.message}. Retrying in ${delayMs}ms...`);

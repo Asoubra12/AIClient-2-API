@@ -58,9 +58,10 @@ export class RiskPolicyEngine {
                 targetState = LIFECYCLE_STATE.DISABLED;
                 break;
             case RISK_SIGNAL.PROVIDER_MARKED_UNHEALTHY:
-                if (normalizedCurrent === LIFECYCLE_STATE.HEALTHY || normalizedCurrent === LIFECYCLE_STATE.UNKNOWN) {
-                    targetState = LIFECYCLE_STATE.QUARANTINED;
-                }
+                // ProviderPool liveness is handled by ProviderPoolManager (isHealthy/needsRefresh/cooldown).
+                // Do not convert generic "unhealthy" into a blocked risk lifecycle state, otherwise transient
+                // failures (proxy blips, network errors, refresh retries) can permanently block good accounts.
+                targetState = normalizedCurrent;
                 break;
             default:
                 targetState = normalizedCurrent;

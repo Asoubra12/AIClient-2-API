@@ -1724,17 +1724,18 @@ export class ProviderPoolManager {
      * @param {object} providerConfig - The configuration of the provider to mark.
      * @param {string} [errorMessage] - Optional error message to store.
      */
-    markProviderUnhealthy(providerType, providerConfig, errorMessage = null) {
-        if (!providerConfig?.uuid) {
-            this._log('error', 'Invalid providerConfig in markProviderUnhealthy');
-            return;
-        }
+	    markProviderUnhealthy(providerType, providerConfig, errorMessage = null) {
+	        if (!providerConfig?.uuid) {
+	            this._log('error', 'Invalid providerConfig in markProviderUnhealthy');
+	            return;
+	        }
 
-        const provider = this._findProvider(providerType, providerConfig.uuid);
-        if (provider) {
-            const now = Date.now();
-            const lastErrorTime = provider.config.lastErrorTime ? new Date(provider.config.lastErrorTime).getTime() : 0;
-            const errorWindowMs = 10000; // 10 秒窗口期
+	        const provider = this._findProvider(providerType, providerConfig.uuid);
+	        if (provider) {
+	            let becameUnhealthy = false;
+	            const now = Date.now();
+	            const lastErrorTime = provider.config.lastErrorTime ? new Date(provider.config.lastErrorTime).getTime() : 0;
+	            const errorWindowMs = 10000; // 10 秒窗口期
 
             // 如果距离上次错误超过窗口期，重置错误计数
             if (now - lastErrorTime > errorWindowMs) {
@@ -1752,30 +1753,35 @@ export class ProviderPoolManager {
                 provider.config.lastErrorMessage = errorMessage;
             }
 
-            if (this.maxErrorCount > 0 && provider.config.errorCount >= this.maxErrorCount) {
-                const wasHealthy = provider.config.isHealthy !== false;
-                provider.config.isHealthy = false;
-                if (wasHealthy) {
-                    provider.config.unhealthySetAt = provider.config.lastErrorTime;
-                    provider.config.unhealthyReasonCode = provider.config.unhealthyReasonCode || 'ERROR_THRESHOLD';
-                    provider.config.unhealthyReasonMessage = errorMessage ? String(errorMessage).slice(0, 240) : provider.config.unhealthyReasonMessage;
-                }
-                this._log('warn', `Marked provider as unhealthy: ${providerConfig.uuid} for type ${providerType}. Total errors: ${provider.config.errorCount}`);
-            } 
-            provider.config.authFailureStreak = (provider.config.authFailureStreak || 0) + 1;
+	            if (this.maxErrorCount > 0 && provider.config.errorCount >= this.maxErrorCount) {
+	                const wasHealthy = provider.config.isHealthy !== false;
+	                provider.config.isHealthy = false;
+	                if (wasHealthy) {
+	                    becameUnhealthy = true;
+	                    provider.config.unhealthySetAt = provider.config.lastErrorTime;
+	                    provider.config.unhealthyReasonCode = provider.config.unhealthyReasonCode || 'ERROR_THRESHOLD';
+	                    provider.config.unhealthyReasonMessage = errorMessage ? String(errorMessage).slice(0, 240) : provider.config.unhealthyReasonMessage;
+	                }
+	                this._log('warn', `Marked provider as unhealthy: ${providerConfig.uuid} for type ${providerType}. Total errors: ${provider.config.errorCount}`);
+	            } 
+	            provider.config.authFailureStreak = (provider.config.authFailureStreak || 0) + 1;
 
-            this._emitRiskSignal(RISK_SIGNAL.PROVIDER_MARKED_UNHEALTHY, providerType, provider.config, {
-                reasonCode: 'PROVIDER_SIGNAL',
-                errorMessage,
-                metadata: {
-                    errorCount: provider.config.errorCount,
-                    isHealthy: provider.config.isHealthy
-                }
-            });
+	            // Only emit the "marked unhealthy" risk signal when the provider actually transitions
+	            // to an unhealthy state. Emitting this on every transient error causes false quarantine.
+	            if (becameUnhealthy) {
+	                this._emitRiskSignal(RISK_SIGNAL.PROVIDER_MARKED_UNHEALTHY, providerType, provider.config, {
+	                    reasonCode: 'PROVIDER_SIGNAL',
+	                    errorMessage,
+	                    metadata: {
+	                        errorCount: provider.config.errorCount,
+	                        isHealthy: provider.config.isHealthy
+	                    }
+	                });
+	            }
 
-            this._debouncedSave(providerType);
-        }
-    }
+	            this._debouncedSave(providerType);
+	        }
+	    }
 
     /**
      * Marks a provider as unhealthy immediately (without accumulating error count).
