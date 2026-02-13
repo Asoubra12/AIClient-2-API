@@ -14,6 +14,7 @@ import * as oauthApi from '../ui-modules/oauth-api.js';
 import * as browserProfileApi from '../ui-modules/browser-profile-api.js';
 import * as eventBroadcast from '../ui-modules/event-broadcast.js';
 import * as riskApi from '../ui-modules/risk-api.js';
+import * as proxyApi from '../ui-modules/proxy-api.js';
 
 // Re-export from event-broadcast module
 export { broadcastEvent, initializeUIManagement, handleUploadOAuthCredentials, upload } from '../ui-modules/event-broadcast.js';
@@ -401,6 +402,11 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
     // Import AWS SSO credentials for Kiro
     if (method === 'POST' && pathParam === '/api/kiro/import-aws-credentials') {
         return await oauthApi.handleImportAwsCredentials(req, res);
+    }
+
+    // Proxy self-test (safe: no credentials echoed back)
+    if (method === 'POST' && pathParam === '/api/proxy/test') {
+        return await proxyApi.handleProxySelfTest(req, res, currentConfig, providerPoolManager);
     }
 
     // Get plugins list

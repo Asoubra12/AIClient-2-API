@@ -1052,6 +1052,13 @@ function maskSecret(value) {
     return `${trimmed.slice(0, 8)}...${trimmed.slice(-4)}`;
 }
 
+function fingerprintSecret(value) {
+    const raw = value === undefined || value === null ? '' : String(value);
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+    return crypto.createHash('sha256').update(trimmed).digest('hex').slice(0, 12);
+}
+
 function maskProxyUrl(value) {
     const raw = value === undefined || value === null ? '' : String(value).trim();
     if (!raw) return '';
@@ -1207,6 +1214,9 @@ export async function handleInspectProvider(req, res, currentConfig, providerPoo
         const authMethod = credentials?.authMethod || providerConfig.authMethod || '';
         const idcRegion = credentials?.idcRegion || credentials?.region || providerConfig.idcRegion || providerConfig.region || 'us-east-1';
         const startUrl = credentials?.startUrl || providerConfig.startUrl || '';
+        const identityEmail = providerConfig.identityEmail || credentials?.identityEmail || credentials?.email || '';
+        const identityStatus = providerConfig.identityStatus || credentials?.identityStatus || credentials?.status || '';
+        const identityResolvedAt = providerConfig.identityResolvedAt || credentials?.identityResolvedAt || '';
 
         const machineId =
             providerConfig.machineId ||
@@ -1222,6 +1232,10 @@ export async function handleInspectProvider(req, res, currentConfig, providerPoo
         const expiresAtMs = expiresAt ? Date.parse(String(expiresAt)) : NaN;
         const now = Date.now();
         const expiresInMs = Number.isFinite(expiresAtMs) ? Math.max(0, expiresAtMs - now) : null;
+        const accessTokenFingerprint = accessToken ? fingerprintSecret(accessToken) : '';
+        const refreshTokenFingerprint = refreshToken ? fingerprintSecret(refreshToken) : '';
+        const clientIdFingerprint = clientId ? fingerprintSecret(clientId) : '';
+        const machineIdFingerprint = machineId ? fingerprintSecret(machineId) : '';
 
         const result = {
             providerType,
@@ -1234,11 +1248,39 @@ export async function handleInspectProvider(req, res, currentConfig, providerPoo
                 isHealthy: providerConfig.isHealthy !== false,
                 needsRefresh: providerConfig.needsRefresh === true,
                 isDisabled: providerConfig.isDisabled === true,
+                refreshCount: providerConfig.refreshCount ?? null,
+                authFailureStreak: providerConfig.authFailureStreak ?? null,
+                lastRefreshAttemptAt: providerConfig.lastRefreshAttemptAt || null,
+                lastSuccessAt: providerConfig.lastSuccessAt || null,
+                cooldownUntil: providerConfig.cooldownUntil || providerConfig.quotaExhaustedUntil || providerConfig.scheduledRecoveryTime || null,
+                cooldownReasonCode: providerConfig.cooldownReasonCode || null,
+                cooldownReasonMessage: providerConfig.cooldownReasonMessage
+                    ? String(providerConfig.cooldownReasonMessage).slice(0, 240)
+                    : null,
+                cooldownSetAt: providerConfig.cooldownSetAt || null,
+                needsRefreshReasonCode: providerConfig.needsRefreshReasonCode || null,
+                needsRefreshReasonMessage: providerConfig.needsRefreshReasonMessage
+                    ? String(providerConfig.needsRefreshReasonMessage).slice(0, 240)
+                    : null,
+                needsRefreshSetAt: providerConfig.needsRefreshSetAt || null,
+                unhealthyReasonCode: providerConfig.unhealthyReasonCode || null,
+                unhealthyReasonMessage: providerConfig.unhealthyReasonMessage
+                    ? String(providerConfig.unhealthyReasonMessage).slice(0, 240)
+                    : null,
+                unhealthySetAt: providerConfig.unhealthySetAt || null,
                 lastError: providerConfig.lastError
                     ? redactInlineCredentials(String(providerConfig.lastError)).slice(0, 240)
                     : '',
                 proxy: proxyMasked || '',
-                machineId: machineId ? maskSecret(machineId) : ''
+                machineId: machineId ? maskSecret(machineId) : '',
+                machineIdFingerprint,
+                identityEmail: identityEmail ? maskSecret(identityEmail) : '',
+                identityStatus: identityStatus ? String(identityStatus).slice(0, 64) : '',
+                identityResolvedAt: identityResolvedAt ? String(identityResolvedAt) : '',
+                kiroLastEndpoint: providerConfig.kiroLastEndpoint || null,
+                kiroLastEndpointAt: providerConfig.kiroLastEndpointAt || null,
+                kiroEndpointFailoverUsed: providerConfig.kiroEndpointFailoverUsed === true,
+                kiroEndpointFailoverLastAt: providerConfig.kiroEndpointFailoverLastAt || null
             },
             credentials: {
                 path: credsPathRaw,
@@ -1247,8 +1289,11 @@ export async function handleInspectProvider(req, res, currentConfig, providerPoo
                 startUrl: startUrl ? String(startUrl) : '',
                 profileArn: profileArn ? maskSecret(profileArn) : '',
                 clientId: clientId ? maskSecret(clientId) : '',
+                clientIdFingerprint,
                 accessToken: accessToken ? maskSecret(accessToken) : '',
+                accessTokenFingerprint,
                 refreshToken: refreshToken ? maskSecret(refreshToken) : '',
+                refreshTokenFingerprint,
                 expiresAt: expiresAt ? String(expiresAt) : '',
                 expiresInMs
             },

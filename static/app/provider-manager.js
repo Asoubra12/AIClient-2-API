@@ -649,6 +649,18 @@ function validateMachineId(value) {
     return /^[A-Za-z0-9._:-]+$/.test(s);
 }
 
+function validateProxyUrl(value) {
+    const s = String(value || '').trim();
+    if (!s) return false;
+    try {
+        const url = new URL(s);
+        const protocol = String(url.protocol || '').toLowerCase();
+        return protocol === 'http:' || protocol === 'https:' || protocol === 'socks5:' || protocol === 'socks4:' || protocol === 'socks:';
+    } catch {
+        return false;
+    }
+}
+
 async function showKiroEnterpriseWizard(providerType) {
     const modal = document.createElement('div');
     modal.className = 'modal-overlay';
@@ -2735,7 +2747,7 @@ async function showKiroAwsImportModal(providerType = 'claude-kiro-oauth') {
                 if (shouldCreateNode) {
                     const accountId = normalizeNonEmptyString(nodeAccountIdEl?.value);
                     const customName = normalizeNonEmptyString(nodeCustomNameEl?.value) || accountId;
-                    const machineId = normalizeNonEmptyString(nodeMachineIdEl?.value);
+                    let machineId = normalizeNonEmptyString(nodeMachineIdEl?.value);
                     const proxyEnabled = nodeProxyEnabledEl?.checked === true;
                     const proxyUrl = proxyEnabled ? normalizeNonEmptyString(nodeProxyUrlEl?.value) : '';
                     const useBitbrowser = nodeBitbrowserEnabledEl?.checked === true;
@@ -2751,6 +2763,21 @@ async function showKiroAwsImportModal(providerType = 'claude-kiro-oauth') {
                         showToast(t('common.warning'), `${t('modal.provider.kiroWizard.proxyUrl')} ${t('common.required') || 'required'}`, 'warning');
                         nodeProxyUrlEl?.focus?.();
                         return;
+                    }
+                    if (proxyEnabled && proxyUrl && !validateProxyUrl(proxyUrl)) {
+                        showToast(t('common.warning'), `${t('modal.provider.kiroWizard.proxyUrl')} ${t('common.invalid') || 'invalid'}`, 'warning');
+                        nodeProxyUrlEl?.focus?.();
+                        return;
+                    }
+                    if (!machineId) {
+                        try {
+                            machineId = window?.crypto?.randomUUID ? window.crypto.randomUUID() : `machine-${Date.now()}`;
+                        } catch {
+                            machineId = `machine-${Date.now()}`;
+                        }
+                        if (nodeMachineIdEl) {
+                            nodeMachineIdEl.value = machineId;
+                        }
                     }
                     if (machineId && !validateMachineId(machineId)) {
                         showToast(t('common.warning'), `${t('modal.provider.kiroWizard.machineId')} ${t('common.invalid') || 'invalid'}`, 'warning');

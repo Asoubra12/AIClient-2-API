@@ -632,14 +632,16 @@ export class ProviderPoolManager {
         });
     }
 
-    _isBlockedByRiskPolicy(providerType, providerConfig) {
+    _isBlockedByRiskPolicy(providerType, providerConfig, options = {}) {
         if (!providerType || !providerConfig?.uuid) return false;
         const riskManager = getRiskManager();
         if (!riskManager?.isEnabled?.()) return false;
 
         const admission = riskManager.getAdmissionDecision(providerType, providerConfig.uuid);
         if (admission.blocked) {
-            this._log('warn', `RiskPolicy blocked provider ${providerType}/${providerConfig.uuid} (state=${admission.lifecycleState}, mode=${admission.mode})`);
+            if (options?.silent !== true) {
+                this._log('warn', `RiskPolicy blocked provider ${providerType}/${providerConfig.uuid} (state=${admission.lifecycleState}, mode=${admission.mode})`);
+            }
             return true;
         }
         return false;
@@ -982,6 +984,9 @@ export class ProviderPoolManager {
 
         provider.config.cooldownUntil = cooldownUntil;
         provider.config.quotaExhaustedUntil = cooldownUntil;
+        provider.config.cooldownSetAt = new Date().toISOString();
+        provider.config.cooldownReasonCode = options.reasonCode || provider.config.cooldownReasonCode || 'CONTROL_PLANE_COOLDOWN';
+        provider.config.cooldownReasonMessage = options.reason ? String(options.reason).slice(0, 240) : provider.config.cooldownReasonMessage;
         this._debouncedSave(providerType);
 
         this._emitRiskSignal(RISK_SIGNAL.QUOTA_EXCEEDED, providerType, provider.config, {
@@ -1032,6 +1037,9 @@ export class ProviderPoolManager {
         provider.config.cooldownUntil = null;
         provider.config.quotaExhaustedUntil = null;
         provider.config.scheduledRecoveryTime = null;
+        provider.config.cooldownReasonCode = null;
+        provider.config.cooldownReasonMessage = null;
+        provider.config.cooldownSetAt = null;
         this._debouncedSave(providerType);
 
         this._recordControlPlaneAction('clear_cooldown', providerType, provider.config, {
@@ -1120,28 +1128,65 @@ export class ProviderPoolManager {
             ? Math.max(1, Math.min(50, Number(options.maxCandidates)))
             : 20;
 
-        let candidates = availableProviders.filter((p) => {
-            if (!p.config.isHealthy || p.config.isDisabled || p.config.needsRefresh || p.config.isDraining === true) {
-                return false;
-            }
-            if (this.accountRotationPolicyEnabled && this._isNodeCoolingDown(p.config, now)) {
-                return false;
-            }
-            return true;
-        });
+        const excludedCounts = {
+            disabled: 0,
+            unhealthy: 0,
+            needsRefresh: 0,
+            draining: 0,
+            coolingDown: 0,
+            blockedByRiskPolicy: 0,
+            modelNotSupported: 0
+        };
+        let nextAvailableAtMs = null;
 
-        const beforeRiskFilterCount = candidates.length;
-        candidates = candidates.filter((provider) => !this._isBlockedByRiskPolicy(providerType, provider.config));
-        const blockedByRiskPolicyCount = beforeRiskFilterCount - candidates.length;
+        let candidates = [];
+        for (const providerStatus of availableProviders) {
+            const config = providerStatus?.config || {};
 
-        if (requestedModel) {
-            candidates = candidates.filter((provider) => {
-                if (!provider.config.notSupportedModels || !Array.isArray(provider.config.notSupportedModels)) {
-                    return true;
+            if (config.isDisabled) {
+                excludedCounts.disabled++;
+                continue;
+            }
+            if (!config.isHealthy) {
+                excludedCounts.unhealthy++;
+                const cooldownMs = this._normalizeTimestamp(this._resolveNodeCooldownUntil(config));
+                if (cooldownMs !== null && cooldownMs > now) {
+                    nextAvailableAtMs = nextAvailableAtMs === null ? cooldownMs : Math.min(nextAvailableAtMs, cooldownMs);
                 }
-                return !provider.config.notSupportedModels.includes(requestedModel);
-            });
+                continue;
+            }
+            if (config.needsRefresh) {
+                excludedCounts.needsRefresh++;
+                continue;
+            }
+            if (config.isDraining === true) {
+                excludedCounts.draining++;
+                continue;
+            }
+            if (this.accountRotationPolicyEnabled && this._isNodeCoolingDown(config, now)) {
+                excludedCounts.coolingDown++;
+                const cooldownMs = this._normalizeTimestamp(this._resolveNodeCooldownUntil(config));
+                if (cooldownMs !== null && cooldownMs > now) {
+                    nextAvailableAtMs = nextAvailableAtMs === null ? cooldownMs : Math.min(nextAvailableAtMs, cooldownMs);
+                }
+                continue;
+            }
+            if (this._isBlockedByRiskPolicy(providerType, config, { silent: true })) {
+                excludedCounts.blockedByRiskPolicy++;
+                continue;
+            }
+            if (requestedModel) {
+                if (Array.isArray(config.notSupportedModels) && config.notSupportedModels.includes(requestedModel)) {
+                    excludedCounts.modelNotSupported++;
+                    continue;
+                }
+            }
+
+            candidates.push(providerStatus);
         }
+
+        const blockedByRiskPolicyCount = excludedCounts.blockedByRiskPolicy;
+        const nextAvailableAt = nextAvailableAtMs !== null ? new Date(nextAvailableAtMs).toISOString() : null;
 
         if (candidates.length > 0) {
             const minPriority = Math.min(...candidates.map((provider) => this._getProviderPriority(provider.config)));
@@ -1187,6 +1232,8 @@ export class ProviderPoolManager {
             totalProviders: availableProviders.length,
             candidateCount: sorted.length,
             blockedByRiskPolicyCount,
+            excludedCounts,
+            nextAvailableAt,
             selected: top ? toCandidate(top) : null,
             candidates: sorted.slice(0, maxCandidates).map(toCandidate)
         };
@@ -1234,6 +1281,17 @@ export class ProviderPoolManager {
                 providerConfig.cooldownUntil = providerConfig.cooldownUntil || null;
                 providerConfig.quotaExhaustedUntil = providerConfig.quotaExhaustedUntil || providerConfig.scheduledRecoveryTime || null;
                 providerConfig.isDraining = providerConfig.isDraining === true;
+
+                // Explicit, user-visible state-machine reason fields (enterprise ops / debuggability).
+                providerConfig.cooldownReasonCode = providerConfig.cooldownReasonCode || null;
+                providerConfig.cooldownReasonMessage = providerConfig.cooldownReasonMessage || null;
+                providerConfig.cooldownSetAt = providerConfig.cooldownSetAt || null;
+                providerConfig.needsRefreshReasonCode = providerConfig.needsRefreshReasonCode || null;
+                providerConfig.needsRefreshReasonMessage = providerConfig.needsRefreshReasonMessage || null;
+                providerConfig.needsRefreshSetAt = providerConfig.needsRefreshSetAt || null;
+                providerConfig.unhealthyReasonCode = providerConfig.unhealthyReasonCode || null;
+                providerConfig.unhealthyReasonMessage = providerConfig.unhealthyReasonMessage || null;
+                providerConfig.unhealthySetAt = providerConfig.unhealthySetAt || null;
                 
                 // 优化2: 简化 lastErrorTime 处理逻辑
                 providerConfig.lastErrorTime = providerConfig.lastErrorTime instanceof Date
@@ -1324,7 +1382,7 @@ export class ProviderPoolManager {
         // - enforce-strict: also block quarantined/disabled
         const beforeRiskPolicyCount = availableAndHealthyProviders.length;
         availableAndHealthyProviders = availableAndHealthyProviders.filter((provider) =>
-            !this._isBlockedByRiskPolicy(providerType, provider.config)
+            !this._isBlockedByRiskPolicy(providerType, provider.config, { silent: true })
         );
         const blockedByPolicyCount = beforeRiskPolicyCount - availableAndHealthyProviders.length;
         if (blockedByPolicyCount > 0) {
@@ -1631,8 +1689,11 @@ export class ProviderPoolManager {
      * 标记提供商需要刷新并推入刷新队列
      * @param {string} providerType - 提供商类型
      * @param {object} providerConfig - 提供商配置（包含 uuid）
+     * @param {string|null} [reason] - Optional human-readable reason (UI-safe).
+     * @param {object} [options]
+     * @param {string} [options.reasonCode]
      */
-    markProviderNeedRefresh(providerType, providerConfig) {
+    markProviderNeedRefresh(providerType, providerConfig, reason = null, options = {}) {
         if (!providerConfig?.uuid) {
             this._log('error', 'Invalid providerConfig in markProviderNeedRefresh');
             return;
@@ -1642,6 +1703,9 @@ export class ProviderPoolManager {
         if (provider) {
             provider.config.needsRefresh = true;
             provider.config.authFailureStreak = (provider.config.authFailureStreak || 0) + 1;
+            provider.config.needsRefreshSetAt = new Date().toISOString();
+            provider.config.needsRefreshReasonCode = options?.reasonCode || 'NEEDS_REFRESH';
+            provider.config.needsRefreshReasonMessage = reason ? String(reason).slice(0, 240) : provider.config.needsRefreshReasonMessage;
             this._log('info', `Marked provider ${providerConfig.uuid} as needsRefresh. Enqueuing...`);
             this._emitRiskSignal(RISK_SIGNAL.PROVIDER_NEEDS_REFRESH, providerType, provider.config, {
                 reasonCode: 'PROVIDER_SIGNAL'
@@ -1689,7 +1753,13 @@ export class ProviderPoolManager {
             }
 
             if (this.maxErrorCount > 0 && provider.config.errorCount >= this.maxErrorCount) {
+                const wasHealthy = provider.config.isHealthy !== false;
                 provider.config.isHealthy = false;
+                if (wasHealthy) {
+                    provider.config.unhealthySetAt = provider.config.lastErrorTime;
+                    provider.config.unhealthyReasonCode = provider.config.unhealthyReasonCode || 'ERROR_THRESHOLD';
+                    provider.config.unhealthyReasonMessage = errorMessage ? String(errorMessage).slice(0, 240) : provider.config.unhealthyReasonMessage;
+                }
                 this._log('warn', `Marked provider as unhealthy: ${providerConfig.uuid} for type ${providerType}. Total errors: ${provider.config.errorCount}`);
             } 
             provider.config.authFailureStreak = (provider.config.authFailureStreak || 0) + 1;
@@ -1725,8 +1795,12 @@ export class ProviderPoolManager {
             provider.config.isHealthy = false;
             provider.config.errorCount = this.maxErrorCount; // Set to max to indicate definitive failure
             provider.config.authFailureStreak = (provider.config.authFailureStreak || 0) + 1;
-            provider.config.lastErrorTime = new Date().toISOString();
-            provider.config.lastUsed = new Date().toISOString();
+            const nowIso = new Date().toISOString();
+            provider.config.lastErrorTime = nowIso;
+            provider.config.lastUsed = nowIso;
+            provider.config.unhealthySetAt = nowIso;
+            provider.config.unhealthyReasonCode = provider.config.unhealthyReasonCode || 'UNHEALTHY_IMMEDIATE';
+            provider.config.unhealthyReasonMessage = errorMessage ? String(errorMessage).slice(0, 240) : provider.config.unhealthyReasonMessage;
 
             if (errorMessage) {
                 provider.config.lastErrorMessage = errorMessage;
@@ -1761,8 +1835,12 @@ export class ProviderPoolManager {
             provider.config.isHealthy = false;
             provider.config.errorCount = this.maxErrorCount; // Set to max to indicate definitive failure
             provider.config.authFailureStreak = (provider.config.authFailureStreak || 0) + 1;
-            provider.config.lastErrorTime = new Date().toISOString();
-            provider.config.lastUsed = new Date().toISOString();
+            const nowIso = new Date().toISOString();
+            provider.config.lastErrorTime = nowIso;
+            provider.config.lastUsed = nowIso;
+            provider.config.unhealthySetAt = nowIso;
+            provider.config.unhealthyReasonCode = provider.config.unhealthyReasonCode || 'UNHEALTHY_WITH_RECOVERY';
+            provider.config.unhealthyReasonMessage = errorMessage ? String(errorMessage).slice(0, 240) : provider.config.unhealthyReasonMessage;
 
             if (errorMessage) {
                 provider.config.lastErrorMessage = errorMessage;
@@ -1774,6 +1852,9 @@ export class ProviderPoolManager {
                 provider.config.scheduledRecoveryTime = recoveryDate.toISOString();
                 provider.config.cooldownUntil = recoveryDate.toISOString();
                 provider.config.quotaExhaustedUntil = recoveryDate.toISOString();
+                provider.config.cooldownSetAt = nowIso;
+                provider.config.cooldownReasonCode = provider.config.cooldownReasonCode || 'QUOTA_EXCEEDED';
+                provider.config.cooldownReasonMessage = errorMessage ? String(errorMessage).slice(0, 240) : provider.config.cooldownReasonMessage;
                 this._log('warn', `Marked provider as unhealthy with recovery time: ${providerConfig.uuid} for type ${providerType}. Recovery at: ${recoveryDate.toISOString()}. Reason: ${errorMessage || 'Quota exhausted'}`);
                 this._emitRiskSignal(RISK_SIGNAL.QUOTA_EXCEEDED, providerType, provider.config, {
                     reasonCode: 'PROVIDER_SIGNAL',
@@ -1820,6 +1901,15 @@ export class ProviderPoolManager {
             provider.config.scheduledRecoveryTime = null;
             provider.config.cooldownUntil = null;
             provider.config.quotaExhaustedUntil = null;
+            provider.config.cooldownReasonCode = null;
+            provider.config.cooldownReasonMessage = null;
+            provider.config.cooldownSetAt = null;
+            provider.config.needsRefreshReasonCode = null;
+            provider.config.needsRefreshReasonMessage = null;
+            provider.config.needsRefreshSetAt = null;
+            provider.config.unhealthyReasonCode = null;
+            provider.config.unhealthyReasonMessage = null;
+            provider.config.unhealthySetAt = null;
             provider.config.lastSuccessAt = new Date().toISOString();
             
             // 更新健康检测信息
@@ -1868,6 +1958,15 @@ export class ProviderPoolManager {
             provider.config.scheduledRecoveryTime = null;
             provider.config.cooldownUntil = null;
             provider.config.quotaExhaustedUntil = null;
+            provider.config.cooldownReasonCode = null;
+            provider.config.cooldownReasonMessage = null;
+            provider.config.cooldownSetAt = null;
+            provider.config.needsRefreshReasonCode = null;
+            provider.config.needsRefreshReasonMessage = null;
+            provider.config.needsRefreshSetAt = null;
+            provider.config.unhealthyReasonCode = null;
+            provider.config.unhealthyReasonMessage = null;
+            provider.config.unhealthySetAt = null;
             provider.config.lastSuccessAt = new Date().toISOString();
             // 更新为可用
             provider.config.lastHealthCheckTime = new Date().toISOString();
@@ -2004,6 +2103,43 @@ export class ProviderPoolManager {
         }
 
         return updated;
+    }
+
+    /**
+     * Runtime-only patch helper: updates provider config in-memory without persisting
+     * and without recording control-plane/risk events.
+     *
+     * This is intended for high-frequency observability fields (e.g. "last endpoint used")
+     * where writing provider_pools.json would be too noisy.
+     *
+     * @param {string} providerType
+     * @param {string} uuid
+     * @param {object} patch
+     * @returns {object|null}
+     */
+    patchProviderRuntimeMetadata(providerType, uuid, patch = {}) {
+        if (!providerType || !uuid || !patch || typeof patch !== 'object') {
+            this._log('error', 'Invalid parameters in patchProviderRuntimeMetadata');
+            return null;
+        }
+
+        const provider = this._findProvider(providerType, uuid);
+        if (!provider) {
+            return null;
+        }
+
+        Object.assign(provider.config, patch);
+
+        // Keep providerPools in sync for UI reads (best-effort).
+        const poolArray = this.providerPools?.[providerType];
+        if (Array.isArray(poolArray)) {
+            const idx = poolArray.findIndex((p) => p?.uuid === uuid);
+            if (idx !== -1 && poolArray[idx]) {
+                Object.assign(poolArray[idx], patch);
+            }
+        }
+
+        return provider.config;
     }
 
     /**

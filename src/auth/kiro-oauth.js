@@ -645,6 +645,18 @@ async function pollKiroBuilderIDToken(clientId, clientSecret, deviceCode, interv
                     clientSecret,
                     idcRegion: options.region || 'us-east-1'
                 };
+
+                // Persist per-account machine ID (UUID-like) for deterministic identity resolution + UA headers.
+                const machineId = normalizeMachineId(options?.machineId || options?.KIRO_MACHINE_ID) || crypto.randomUUID();
+                tokenData.machineId = machineId;
+
+                // Best-effort: resolve stable identity (accountId d-...) + email/status from usage limits.
+                await resolveAndApplyKiroIdentity(tokenData, {
+                    region: tokenData.idcRegion,
+                    machineId,
+                    proxyUrlOverride: options?.proxyUrlOverride,
+                    logLabel: 'builder-id-device-code'
+                });
                 
                 await fs.promises.mkdir(path.dirname(credPath), { recursive: true });
                 await fs.promises.writeFile(credPath, JSON.stringify(tokenData, null, 2));
@@ -661,13 +673,29 @@ async function pollKiroBuilderIDToken(clientId, clientSecret, deviceCode, interv
                 });
 
                 const relativePath = path.relative(process.cwd(), credPath);
+                const attachPatch = {
+                    authMethod: 'builder-id',
+                    machineId,
+                    KIRO_MACHINE_ID: machineId
+                };
+                if (tokenData.accountId) {
+                    attachPatch.accountId = tokenData.accountId;
+                    attachPatch.KIRO_ACCOUNT_ID = tokenData.accountId;
+                }
+                if (tokenData.identityEmail) {
+                    attachPatch.identityEmail = tokenData.identityEmail;
+                }
+                if (tokenData.identityStatus) {
+                    attachPatch.identityStatus = tokenData.identityStatus;
+                }
+                if (tokenData.identityResolvedAt) {
+                    attachPatch.identityResolvedAt = tokenData.identityResolvedAt;
+                }
                 const attached = attachCredentialToProviderNode(
                     'claude-kiro-oauth',
                     options.attachToProviderUuid || options.targetProviderUuid,
                     relativePath,
-                    {
-                        authMethod: 'builder-id'
-                    }
+                    attachPatch
                 );
 
                 if (!attached) {
@@ -893,6 +921,18 @@ async function startKiroIamSsoCallbackServer({
                     saveData.registrationExpiresAt = registrationExpiresAt;
                 }
 
+                // Persist per-account machine ID for deterministic identity resolution + UA headers.
+                const machineId = normalizeMachineId(options?.machineId || options?.KIRO_MACHINE_ID) || crypto.randomUUID();
+                saveData.machineId = machineId;
+
+                // Best-effort: resolve stable identity (accountId d-...) + email/status from usage limits.
+                await resolveAndApplyKiroIdentity(saveData, {
+                    region,
+                    machineId,
+                    proxyUrlOverride: options?.proxyUrlOverride,
+                    logLabel: 'iam-identity-center'
+                });
+
                 await fs.promises.mkdir(path.dirname(credPath), { recursive: true });
                 await fs.promises.writeFile(credPath, JSON.stringify(saveData, null, 2));
 
@@ -911,11 +951,23 @@ async function startKiroIamSsoCallbackServer({
                     providerKey,
                     options.attachToProviderUuid || options.targetProviderUuid,
                     relativePath,
-                    {
-                        authMethod: 'iam-identity-center',
-                        startUrl,
-                        idcRegion: region
-                    }
+                    (() => {
+                        const patch = {
+                            authMethod: 'iam-identity-center',
+                            startUrl,
+                            idcRegion: region,
+                            machineId,
+                            KIRO_MACHINE_ID: machineId
+                        };
+                        if (saveData.accountId) {
+                            patch.accountId = saveData.accountId;
+                            patch.KIRO_ACCOUNT_ID = saveData.accountId;
+                        }
+                        if (saveData.identityEmail) patch.identityEmail = saveData.identityEmail;
+                        if (saveData.identityStatus) patch.identityStatus = saveData.identityStatus;
+                        if (saveData.identityResolvedAt) patch.identityResolvedAt = saveData.identityResolvedAt;
+                        return patch;
+                    })()
                 );
 
                 if (!attached) {
@@ -1172,6 +1224,19 @@ function createKiroHttpCallbackServer(port, codeVerifier, expectedState, options
                         authMethod: 'social',
                         region: 'us-east-1'
                     };
+
+                    // Persist per-account machine ID for deterministic identity resolution + UA headers.
+                    const machineId = normalizeMachineId(options?.machineId || options?.KIRO_MACHINE_ID) || crypto.randomUUID();
+                    saveData.machineId = machineId;
+
+                    // Best-effort: resolve stable identity (accountId d-...) + email/status from usage limits.
+                    await resolveAndApplyKiroIdentity(saveData, {
+                        region: saveData.region,
+                        machineId,
+                        profileArn: saveData.profileArn || null,
+                        proxyUrlOverride: options?.proxyUrlOverride,
+                        logLabel: 'social'
+                    });
                     
                     await fs.promises.mkdir(path.dirname(credPath), { recursive: true });
                     await fs.promises.writeFile(credPath, JSON.stringify(saveData, null, 2));
@@ -1192,10 +1257,22 @@ function createKiroHttpCallbackServer(port, codeVerifier, expectedState, options
                         'claude-kiro-oauth',
                         options.attachToProviderUuid || options.targetProviderUuid,
                         relativePath,
-                        {
-                            authMethod: 'social',
-                            profileArn: saveData.profileArn || null
-                        }
+                        (() => {
+                            const patch = {
+                                authMethod: 'social',
+                                profileArn: saveData.profileArn || null,
+                                machineId,
+                                KIRO_MACHINE_ID: machineId
+                            };
+                            if (saveData.accountId) {
+                                patch.accountId = saveData.accountId;
+                                patch.KIRO_ACCOUNT_ID = saveData.accountId;
+                            }
+                            if (saveData.identityEmail) patch.identityEmail = saveData.identityEmail;
+                            if (saveData.identityStatus) patch.identityStatus = saveData.identityStatus;
+                            if (saveData.identityResolvedAt) patch.identityResolvedAt = saveData.identityResolvedAt;
+                            return patch;
+                        })()
                     );
 
                     if (!attached) {
@@ -1310,15 +1387,19 @@ function buildKiroUsageHeaders(accessToken, machineId) {
     };
 }
 
-async function resolveKiroUserIdFromUsageLimits({ accessToken, region, machineId, proxyUrlOverride }) {
+async function resolveKiroUserIdFromUsageLimits({ accessToken, region, machineId, profileArn = null, proxyUrlOverride }) {
     const safeRegion = String(region || KIRO_REFRESH_CONSTANTS.IDC_REGION).trim() || KIRO_REFRESH_CONSTANTS.IDC_REGION;
     const baseUrl = KIRO_IDENTITY_CONSTANTS.USAGE_LIMITS_URL.replace('{{region}}', safeRegion);
-    const query = new URLSearchParams({
+    const params = new URLSearchParams({
         isEmailRequired: 'true',
         origin: KIRO_IDENTITY_CONSTANTS.ORIGIN,
         resourceType: KIRO_IDENTITY_CONSTANTS.RESOURCE_TYPE
-    }).toString();
-    const url = `${baseUrl}?${query}`;
+    });
+    const profileArnValue = profileArn === undefined || profileArn === null ? '' : String(profileArn).trim();
+    if (profileArnValue) {
+        params.append('profileArn', profileArnValue);
+    }
+    const url = `${baseUrl}?${params.toString()}`;
 
     const response = await fetchWithProxy(url, {
         method: 'GET',
@@ -1334,10 +1415,62 @@ async function resolveKiroUserIdFromUsageLimits({ accessToken, region, machineId
     const data = await response.json();
     const userId = String(data?.userInfo?.userId || data?.userId || '').trim();
     const email = String(data?.userInfo?.email || data?.email || '').trim();
+    const status = String(data?.userInfo?.status || data?.status || '').trim();
     return {
         userId: userId || null,
-        email: email || null
+        email: email || null,
+        status: status || null
     };
+}
+
+async function resolveAndApplyKiroIdentity(credentialsData, {
+    region,
+    machineId,
+    profileArn = null,
+    proxyUrlOverride,
+    logLabel = 'identity'
+} = {}) {
+    if (!credentialsData || typeof credentialsData !== 'object') return null;
+    if (!credentialsData.accessToken) return null;
+
+    const effectiveMachineId =
+        normalizeMachineId(machineId) ||
+        normalizeMachineId(credentialsData.machineId || credentialsData.KIRO_MACHINE_ID) ||
+        null;
+    if (!effectiveMachineId) {
+        return null;
+    }
+
+    try {
+        const identity = await resolveKiroUserIdFromUsageLimits({
+            accessToken: credentialsData.accessToken,
+            region,
+            machineId: effectiveMachineId,
+            profileArn,
+            proxyUrlOverride
+        });
+
+        const nowIso = new Date().toISOString();
+
+        if (identity?.userId) {
+            credentialsData.accountId = identity.userId;
+        }
+        if (identity?.email) {
+            credentialsData.identityEmail = identity.email;
+        }
+        if (identity?.status) {
+            credentialsData.identityStatus = identity.status;
+        }
+
+        if (identity?.userId || identity?.email || identity?.status) {
+            credentialsData.identityResolvedAt = nowIso;
+        }
+
+        return identity || null;
+    } catch (error) {
+        logger.warn(`${KIRO_OAUTH_CONFIG.logPrefix} Resolve identity (${logLabel}) failed: ${error.message}`);
+        return null;
+    }
 }
 
 /**
@@ -1346,7 +1479,7 @@ async function resolveKiroUserIdFromUsageLimits({ accessToken, region, machineId
  * @param {string} region - AWS 区域 (默认: us-east-1)
  * @returns {Promise<Object>} 包含 accessToken 等信息的对象
  */
-async function refreshKiroToken(refreshToken, region = KIRO_REFRESH_CONSTANTS.DEFAULT_REGION) {
+async function refreshKiroToken(refreshToken, region = KIRO_REFRESH_CONSTANTS.DEFAULT_REGION, options = {}) {
     const refreshUrl = KIRO_REFRESH_CONSTANTS.REFRESH_URL.replace('{{region}}', region);
     
     const controller = new AbortController();
@@ -1359,7 +1492,8 @@ async function refreshKiroToken(refreshToken, region = KIRO_REFRESH_CONSTANTS.DE
                 'Content-Type': KIRO_REFRESH_CONSTANTS.CONTENT_TYPE_JSON
             },
             body: JSON.stringify({ refreshToken }),
-            signal: controller.signal
+            signal: controller.signal,
+            proxyUrlOverride: options?.proxyUrlOverride
         }, 'claude-kiro-oauth');
         
         clearTimeout(timeoutId);
@@ -1501,6 +1635,17 @@ export async function batchImportKiroRefreshTokens(refreshTokens, region = KIRO_
             logger.info(`${KIRO_OAUTH_CONFIG.logPrefix} 正在刷新第 ${i + 1}/${refreshTokens.length} 个 token...`);
             
             const tokenData = await refreshKiroToken(refreshToken, region);
+
+            // Best-effort: add deterministic identity fields (d-...) for UI/pool parity with KAM.
+            // For batch imports there is no bound provider node yet, so we generate a per-cred machineId.
+            const machineId = crypto.randomUUID();
+            tokenData.machineId = machineId;
+            await resolveAndApplyKiroIdentity(tokenData, {
+                region,
+                machineId,
+                profileArn: tokenData.profileArn || null,
+                logLabel: 'batch-import'
+            });
             
             // 生成文件路径: configs/kiro/{timestamp}_kiro-auth-token/{timestamp}_kiro-auth-token.json
             const timestamp = Date.now();
@@ -1519,7 +1664,10 @@ export async function batchImportKiroRefreshTokens(refreshTokens, region = KIRO_
                 index: i + 1,
                 success: true,
                 path: relativePath,
-                expiresAt: tokenData.expiresAt
+                expiresAt: tokenData.expiresAt,
+                accountId: tokenData.accountId || null,
+                identityEmail: tokenData.identityEmail || null,
+                identityStatus: tokenData.identityStatus || null
             });
             results.success++;
             
@@ -1630,6 +1778,17 @@ export async function batchImportKiroRefreshTokensStream(refreshTokens, region =
             logger.info(`${KIRO_OAUTH_CONFIG.logPrefix} 正在刷新第 ${i + 1}/${refreshTokens.length} 个 token...`);
             
             const tokenData = await refreshKiroToken(refreshToken, region);
+
+            // Best-effort: add deterministic identity fields (d-...) for UI/pool parity with KAM.
+            // For batch imports there is no bound provider node yet, so we generate a per-cred machineId.
+            const machineId = crypto.randomUUID();
+            tokenData.machineId = machineId;
+            await resolveAndApplyKiroIdentity(tokenData, {
+                region,
+                machineId,
+                profileArn: tokenData.profileArn || null,
+                logLabel: 'batch-import-stream'
+            });
             
             // 生成文件路径: configs/kiro/{timestamp}_kiro-auth-token/{timestamp}_kiro-auth-token.json
             const timestamp = Date.now();
@@ -1648,7 +1807,10 @@ export async function batchImportKiroRefreshTokensStream(refreshTokens, region =
                 index: i + 1,
                 success: true,
                 path: relativePath,
-                expiresAt: tokenData.expiresAt
+                expiresAt: tokenData.expiresAt,
+                accountId: tokenData.accountId || null,
+                identityEmail: tokenData.identityEmail || null,
+                identityStatus: tokenData.identityStatus || null
             };
             results.details.push(progressData.current);
             results.success++;
@@ -1826,22 +1988,18 @@ export async function importAwsCredentials(credentials, skipDuplicateCheckOrOpti
             // 继续保存原始凭据
         }
 
-        // 尝试解析真实账号 ID（格式通常为 d-xxxxxxxxxx.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）
-        try {
-            const identity = await resolveKiroUserIdFromUsageLimits({
-                accessToken: credentialsData.accessToken,
-                region: idcRegion,
-                machineId: importedMachineId,
-                proxyUrlOverride: options?.proxyUrlOverride
-            });
-            if (identity?.userId) {
-                credentialsData.accountId = identity.userId;
-                logger.info(`${KIRO_OAUTH_CONFIG.logPrefix} Resolved Kiro accountId from usage limits: ${identity.userId}`);
-            } else {
-                logger.warn(`${KIRO_OAUTH_CONFIG.logPrefix} Usage limits response did not include userId; keep existing accountId`);
-            }
-        } catch (identityError) {
-            logger.warn(`${KIRO_OAUTH_CONFIG.logPrefix} Resolve accountId failed: ${identityError.message}`);
+        // Best-effort: resolve stable identity (accountId d-...) + email/status from usage limits.
+        const resolvedIdentity = await resolveAndApplyKiroIdentity(credentialsData, {
+            region: idcRegion,
+            machineId: importedMachineId,
+            profileArn: credentials?.profileArn || null,
+            proxyUrlOverride: options?.proxyUrlOverride,
+            logLabel: 'importAwsCredentials'
+        });
+        if (resolvedIdentity?.userId) {
+            logger.info(`${KIRO_OAUTH_CONFIG.logPrefix} Resolved Kiro accountId from usage limits: ${resolvedIdentity.userId}`);
+        } else {
+            logger.warn(`${KIRO_OAUTH_CONFIG.logPrefix} Usage limits response did not include userId; keep existing accountId`);
         }
         
         // 生成文件路径: configs/kiro/{timestamp}_kiro-auth-token/{timestamp}_kiro-auth-token.json
@@ -1865,7 +2023,16 @@ export async function importAwsCredentials(credentials, skipDuplicateCheckOrOpti
                 effectiveAttachPatch.accountId = credentialsData.accountId;
                 effectiveAttachPatch.KIRO_ACCOUNT_ID = credentialsData.accountId;
             }
-            if ((machineIdFromPatch || machineIdFromCred) && importedMachineId) {
+            if (credentialsData.identityEmail) {
+                effectiveAttachPatch.identityEmail = credentialsData.identityEmail;
+            }
+            if (credentialsData.identityStatus) {
+                effectiveAttachPatch.identityStatus = credentialsData.identityStatus;
+            }
+            if (credentialsData.identityResolvedAt) {
+                effectiveAttachPatch.identityResolvedAt = credentialsData.identityResolvedAt;
+            }
+            if (importedMachineId) {
                 effectiveAttachPatch.machineId = importedMachineId;
                 effectiveAttachPatch.KIRO_MACHINE_ID = importedMachineId;
             }
@@ -1897,7 +2064,9 @@ export async function importAwsCredentials(credentials, skipDuplicateCheckOrOpti
                 path: relativePath,
                 attachedToProviderUuid: attachToProviderUuid,
                 accountId: credentialsData.accountId || null,
-                machineId: importedMachineId
+                machineId: importedMachineId,
+                identityEmail: credentialsData.identityEmail || null,
+                identityStatus: credentialsData.identityStatus || null
             };
         }
 
@@ -1918,7 +2087,9 @@ export async function importAwsCredentials(credentials, skipDuplicateCheckOrOpti
             success: true,
             path: relativePath,
             accountId: credentialsData.accountId || null,
-            machineId: importedMachineId
+            machineId: importedMachineId,
+            identityEmail: credentialsData.identityEmail || null,
+            identityStatus: credentialsData.identityStatus || null
         };
         
     } catch (error) {

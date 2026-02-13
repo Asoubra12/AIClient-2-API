@@ -9,7 +9,7 @@ import * as http from 'http';
 import * as https from 'https';
 import { getProviderModels } from '../provider-models.js';
 import { countTokens } from '@anthropic-ai/tokenizer';
-import { configureAxiosProxy } from '../../utils/proxy-utils.js';
+import { configureAxiosProxy, getEffectiveProxyUrl, maskProxyUrl } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
 
@@ -25,7 +25,11 @@ const KIRO_THINKING = {
 const KIRO_CONSTANTS = {
     REFRESH_URL: 'https://prod.{{region}}.auth.desktop.kiro.dev/refreshToken',
     REFRESH_IDC_URL: 'https://oidc.{{region}}.amazonaws.com/token',
-    BASE_URL: 'https://q.{{region}}.amazonaws.com/generateAssistantResponse',
+    AMAZONQ_URL: 'https://q.{{region}}.amazonaws.com/generateAssistantResponse',
+    CODEWHISPERER_URL: 'https://codewhisperer.{{region}}.amazonaws.com/generateAssistantResponse',
+    BASE_URL: 'https://q.{{region}}.amazonaws.com/generateAssistantResponse', // backward compat alias
+    AMAZONQ_AMZ_TARGET: 'AmazonQDeveloperStreamingService.SendMessage',
+    CODEWHISPERER_AMZ_TARGET: 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
     DEFAULT_MODEL_NAME: 'claude-sonnet-4-5',
     AXIOS_TIMEOUT: 120000, // 2 minutes timeout for normal requests
     TOKEN_REFRESH_TIMEOUT: 15000, // 15 seconds timeout for token refresh (shorter to avoid blocking)
@@ -36,6 +40,7 @@ const KIRO_CONSTANTS = {
     AUTH_METHOD_SOCIAL: 'social',
     CHAT_TRIGGER_TYPE_MANUAL: 'MANUAL',
     ORIGIN_AI_EDITOR: 'AI_EDITOR',
+    ORIGIN_CLI: 'CLI',
     TOTAL_CONTEXT_TOKENS: 172500, // 总上下文 173k tokens
 };
 
@@ -405,6 +410,15 @@ export class KiroApiService {
         this.modelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME;
         this.axiosInstance = null; // Initialize later in async method
         this.axiosSocialRefreshInstance = null;
+
+        const preferred = pickFirstDefined(config, [
+            'KIRO_PREFERRED_ENDPOINT',
+            'kiroPreferredEndpoint',
+            'preferredEndpoint',
+        ]);
+        this.preferredEndpoint = preferred ? String(preferred).trim().toLowerCase() : null;
+        this.amazonQUrl = null;
+        this.codewhispererUrl = null;
     }
 
     _maskMachineId(machineId) {
@@ -479,6 +493,179 @@ export class KiroApiService {
             'amz-sdk-request': 'attempt=1; max=1',
             'Connection': 'close'
         };
+    }
+
+    _fingerprint(value) {
+        const raw = value === undefined || value === null ? '' : String(value);
+        const trimmed = raw.trim();
+        if (!trimmed) return null;
+        return crypto.createHash('sha256').update(trimmed).digest('hex').slice(0, 12);
+    }
+
+    _getProxyMetaForLogs() {
+        try {
+            const effective = getEffectiveProxyUrl(this.config, MODEL_PROVIDER.KIRO_API);
+            if (!effective?.proxyUrl) {
+                return {
+                    enabled: false,
+                    source: effective?.source || null,
+                    explicitlyDisabled: effective?.explicitlyDisabled === true,
+                    maskedUrl: '',
+                    host: null,
+                    port: null
+                };
+            }
+
+            let host = null;
+            let port = null;
+            try {
+                const u = new URL(effective.proxyUrl);
+                host = u.hostname || null;
+                port = u.port ? Number.parseInt(u.port, 10) : null;
+            } catch {}
+
+            return {
+                enabled: true,
+                source: effective.source || null,
+                explicitlyDisabled: effective.explicitlyDisabled === true,
+                maskedUrl: maskProxyUrl(effective.proxyUrl) || '',
+                host,
+                port: Number.isFinite(port) ? port : null
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    _getSortedKiroEndpoints() {
+        const amazonQUrl = this.amazonQUrl || (KIRO_CONSTANTS.AMAZONQ_URL || '').replace('{{region}}', this.region || 'us-east-1');
+        const codewhispererUrl = this.codewhispererUrl || (KIRO_CONSTANTS.CODEWHISPERER_URL || '').replace('{{region}}', this.region || 'us-east-1');
+
+        const endpoints = [
+            {
+                key: 'amazonq',
+                name: 'AmazonQ',
+                url: amazonQUrl,
+                origin: KIRO_CONSTANTS.ORIGIN_CLI,
+                amzTarget: KIRO_CONSTANTS.AMAZONQ_AMZ_TARGET,
+                agentMode: 'vibe',
+            },
+            {
+                key: 'codewhisperer',
+                name: 'CodeWhisperer',
+                url: codewhispererUrl,
+                origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR,
+                amzTarget: KIRO_CONSTANTS.CODEWHISPERER_AMZ_TARGET,
+                agentMode: 'spec',
+            },
+        ];
+
+        const preferred = this.preferredEndpoint;
+        if (preferred === 'codewhisperer' || preferred === 'cw') {
+            endpoints.sort((a, b) => (a.key === 'codewhisperer' ? -1 : b.key === 'codewhisperer' ? 1 : 0));
+        } else if (preferred === 'amazonq' || preferred === 'q') {
+            endpoints.sort((a, b) => (a.key === 'amazonq' ? -1 : b.key === 'amazonq' ? 1 : 0));
+        }
+
+        return endpoints;
+    }
+
+    _applyEndpointOrigin(requestData, origin) {
+        try {
+            if (requestData?.conversationState?.currentMessage?.userInputMessage) {
+                requestData.conversationState.currentMessage.userInputMessage.origin = origin;
+            }
+        } catch {}
+    }
+
+    _buildEndpointRequestHeaders(token, endpoint) {
+        const headers = {
+            ...this._buildAuthorizedRequestHeaders(token),
+            'X-Amz-Target': endpoint?.amzTarget || '',
+            'x-amzn-kiro-agent-mode': endpoint?.agentMode || 'vibe',
+            'x-amzn-codewhisperer-optout': 'true',
+        };
+
+        if (!headers['X-Amz-Target']) {
+            delete headers['X-Amz-Target'];
+        }
+
+        return headers;
+    }
+
+    async _postWithEndpointFailover(requestData, token, options = {}) {
+        const responseType = options.responseType;
+        const contextLabel = options.contextLabel || 'request';
+        const endpoints = this._getSortedKiroEndpoints();
+        const attempts = [];
+        let lastError = null;
+
+        for (let idx = 0; idx < endpoints.length; idx++) {
+            const endpoint = endpoints[idx];
+            attempts.push({ endpoint: endpoint.key, status: null, code: null });
+
+            this._applyEndpointOrigin(requestData, endpoint.origin);
+            const headers = this._buildEndpointRequestHeaders(token, endpoint);
+
+            const proxySummary = this._getProxyMetaForLogs();
+            const machineId = this._getMachineId();
+            logger.debug('[Kiro] Request meta', {
+                context: contextLabel,
+                uuid: this.uuid || null,
+                accountId: this.accountId || null,
+                endpoint: endpoint.key,
+                proxy: proxySummary,
+                machineIdFingerprint: this._fingerprint(machineId),
+            });
+
+            try {
+                const axiosOptions = { headers };
+                if (responseType) {
+                    axiosOptions.responseType = responseType;
+                }
+                const response = await this.axiosInstance.post(endpoint.url, requestData, axiosOptions);
+
+                const poolManager = getProviderPoolManager();
+                if (poolManager && this.uuid && typeof poolManager.patchProviderRuntimeMetadata === 'function') {
+                    const nowIso = new Date().toISOString();
+                    const patch = {
+                        kiroLastEndpoint: endpoint.key,
+                        kiroLastEndpointAt: nowIso
+                    };
+                    if (idx > 0) {
+                        patch.kiroEndpointFailoverUsed = true;
+                        patch.kiroEndpointFailoverLastAt = nowIso;
+                    }
+                    poolManager.patchProviderRuntimeMetadata(MODEL_PROVIDER.KIRO_API, this.uuid, patch);
+                }
+
+                return response;
+            } catch (error) {
+                lastError = error;
+                const status = error?.response?.status ?? null;
+                const code = error?.code ?? null;
+                attempts[attempts.length - 1].status = status;
+                attempts[attempts.length - 1].code = code;
+
+                // Endpoint failover policy: try alternate endpoint on quota/throttle responses BEFORE switching credentials.
+                const isAuthError = status === 401 || status === 403;
+                const isQuotaOrThrottle = status === 402 || status === 429;
+                const hasNextEndpoint = idx < endpoints.length - 1;
+                if (!isAuthError && isQuotaOrThrottle && hasNextEndpoint) {
+                    logger.info(`[Kiro] ${contextLabel}: endpoint ${endpoint.key} returned ${status}. Trying alternate endpoint...`);
+                    continue;
+                }
+
+                break;
+            }
+        }
+
+        if (lastError && typeof lastError === 'object') {
+            lastError.kiroEndpointAttempts = attempts;
+            lastError.kiroEndpointFinal = attempts.length > 0 ? attempts[attempts.length - 1].endpoint : null;
+        }
+
+        throw lastError || new Error('Kiro request failed');
     }
  
     async initialize() {
@@ -644,7 +831,9 @@ async loadCredentials() {
 
         this.refreshUrl = (this.config.KIRO_REFRESH_URL || KIRO_CONSTANTS.REFRESH_URL).replace("{{region}}", this.region);
         this.refreshIDCUrl = (this.config.KIRO_REFRESH_IDC_URL || KIRO_CONSTANTS.REFRESH_IDC_URL).replace("{{region}}", this.idcRegion);
-        this.baseUrl = (this.config.KIRO_BASE_URL || KIRO_CONSTANTS.BASE_URL).replace("{{region}}", this.region);
+        this.amazonQUrl = (this.config.KIRO_AMAZONQ_URL || this.config.KIRO_BASE_URL || KIRO_CONSTANTS.AMAZONQ_URL).replace("{{region}}", this.region);
+        this.codewhispererUrl = (this.config.KIRO_CODEWHISPERER_URL || KIRO_CONSTANTS.CODEWHISPERER_URL).replace("{{region}}", this.region);
+        this.baseUrl = this.amazonQUrl; // backward compat: baseUrl is AmazonQ endpoint
     } catch (error) {
         logger.warn(`[Kiro Auth] Error during credential loading: ${error.message}`);
     }
@@ -730,6 +919,14 @@ async saveCredentialsToFile(filePath, newData) {
         let lastError = null;
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             try {
+                if (attempt === 0) {
+                    logger.info('[Kiro Auth] Refresh request meta', {
+                        uuid: this.uuid || null,
+                        authMethod: this.authMethod || null,
+                        proxy: this._getProxyMetaForLogs(),
+                        machineIdFingerprint: this._fingerprint(this._getMachineId()),
+                    });
+                }
                 const requestBody = {
                     refreshToken: this.refreshToken,
                 };
@@ -772,6 +969,13 @@ async saveCredentialsToFile(filePath, newData) {
                     }
                     await saveCredentialsToFile(tokenFilePath, updatedTokenData);
 
+                    // Best-effort: resolve and persist stable identity (e.g. d-... userId) after refresh.
+                    try {
+                        await this._resolveAndPersistAccountIdentity(tokenFilePath, saveCredentialsToFile);
+                    } catch (identityError) {
+                        logger.warn('[Kiro Identity] Post-refresh identity sync failed:', identityError?.message || String(identityError));
+                    }
+
                     // 刷新成功，重置 PoolManager 中的刷新状态并标记为健康
                     const poolManager = getProviderPoolManager();
                     if (poolManager && this.uuid) {
@@ -802,6 +1006,80 @@ async saveCredentialsToFile(filePath, newData) {
         throw new Error(`Token refresh failed: ${fallbackMessage}`);
     }
 
+    async _fetchAccountIdentityFromUsageLimits(accessToken) {
+        const token = accessToken || this.accessToken;
+        if (!token) return { userId: null, email: null, status: null };
+
+        const resourceType = 'AGENTIC_REQUEST';
+        let usageLimitsUrl = (this.amazonQUrl || this.baseUrl || KIRO_CONSTANTS.AMAZONQ_URL)
+            .replace('{{region}}', this.region || 'us-east-1')
+            .replace('generateAssistantResponse', 'getUsageLimits');
+
+        const params = new URLSearchParams({
+            isEmailRequired: 'true',
+            origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR,
+            resourceType
+        });
+        if (this.authMethod === KIRO_CONSTANTS.AUTH_METHOD_SOCIAL && this.profileArn) {
+            params.append('profileArn', this.profileArn);
+        }
+        const fullUrl = `${usageLimitsUrl}?${params.toString()}`;
+
+        const headers = this._buildAuthorizedRequestHeaders(token);
+        const response = await this.axiosInstance.get(fullUrl, {
+            headers,
+            timeout: 15000
+        });
+
+        const userInfo = response?.data?.userInfo || {};
+        const userId = String(userInfo.userId || '').trim() || null;
+        const email = String(userInfo.email || '').trim() || null;
+        const status = String(userInfo.status || '').trim() || null;
+
+        return { userId, email, status };
+    }
+
+    async _resolveAndPersistAccountIdentity(tokenFilePath, saveCredentialsToFile) {
+        if (!this.accessToken) return null;
+
+        const proxyMeta = this._getProxyMetaForLogs();
+        const machineId = this._getMachineId();
+        logger.info('[Kiro Identity] Sync identity from usage limits', {
+            uuid: this.uuid || null,
+            proxy: proxyMeta,
+            machineIdFingerprint: this._fingerprint(machineId)
+        });
+
+        const identity = await this._fetchAccountIdentityFromUsageLimits(this.accessToken);
+        if (!identity?.userId) {
+            return null;
+        }
+
+        const nowIso = new Date().toISOString();
+        this.accountId = identity.userId;
+
+        // Persist to credential file (never to provider_pools.json): stable identity + best-effort metadata.
+        await saveCredentialsToFile(tokenFilePath, {
+            accountId: identity.userId,
+            identityEmail: identity.email || null,
+            identityStatus: identity.status || null,
+            identityResolvedAt: nowIso
+        });
+
+        // Persist to provider node config (safe fields only) so UI/pool logic can use stable identity keys.
+        const poolManager = getProviderPoolManager();
+        if (poolManager && this.uuid && typeof poolManager.patchProviderConfig === 'function') {
+            poolManager.patchProviderConfig(MODEL_PROVIDER.KIRO_API, this.uuid, {
+                accountId: identity.userId,
+                KIRO_ACCOUNT_ID: identity.userId,
+                identityEmail: identity.email || null,
+                identityStatus: identity.status || null,
+                identityResolvedAt: nowIso
+            });
+        }
+
+        return identity;
+    }
 
     /**
      * Extract text content from OpenAI message format
@@ -1531,11 +1809,9 @@ async saveCredentialsToFile(filePath, newData) {
 
         try {
             const token = this.accessToken; // Use the already initialized token
-            const headers = this._buildAuthorizedRequestHeaders(token);
-
-            // 当 model 以 kiro-amazonq 开头时，使用 amazonQUrl，否则使用 baseUrl
-            const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
-            const response = await this.axiosInstance.post(requestUrl, requestData, { headers });
+            const response = await this._postWithEndpointFailover(requestData, token, {
+                contextLabel: 'callApi'
+            });
             return response;
         } catch (error) {
             const status = error.response?.status;
@@ -2018,15 +2294,12 @@ async saveCredentialsToFile(filePath, newData) {
         const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
 
         const token = this.accessToken;
-        const headers = this._buildAuthorizedRequestHeaders(token);
-
-        const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
 
         let stream = null;
         try {
-            const response = await this.axiosInstance.post(requestUrl, requestData, { 
-                headers,
-                responseType: 'stream'
+            const response = await this._postWithEndpointFailover(requestData, token, {
+                responseType: 'stream',
+                contextLabel: 'stream'
             });
 
             stream = response.data;

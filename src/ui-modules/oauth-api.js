@@ -80,6 +80,16 @@ export async function handleGenerateAuthUrl(req, res, currentConfig, providerPoo
                 if (Object.prototype.hasOwnProperty.call(targetNodeConfig, 'PROXY_URL')) {
                     options.proxyUrlOverride = targetNodeConfig.PROXY_URL;
                 }
+                // Pass through identity/machine fields so callback flows can stay deterministic.
+                // (Avoid reading provider pools from inside oauth callback handlers.)
+                const machineId = targetNodeConfig.machineId || targetNodeConfig.KIRO_MACHINE_ID || null;
+                if (machineId) {
+                    options.machineId = machineId;
+                }
+                const accountId = targetNodeConfig.accountId || targetNodeConfig.KIRO_ACCOUNT_ID || null;
+                if (accountId) {
+                    options.accountId = accountId;
+                }
             }
             const result = await handleKiroOAuth(currentConfig, options);
             authUrl = result.authUrl;

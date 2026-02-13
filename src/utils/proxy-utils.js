@@ -8,6 +8,25 @@ import logger from './logger.js';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 
+function safeString(value) {
+    return value === undefined || value === null ? '' : String(value);
+}
+
+export function maskProxyUrl(proxyUrl) {
+    const raw = safeString(proxyUrl).trim();
+    if (!raw) return '';
+    try {
+        const url = new URL(raw);
+        const protocol = url.protocol || 'http:';
+        const host = url.hostname;
+        const port = url.port ? `:${url.port}` : '';
+        if (!host) return '';
+        return `${protocol}//${host}${port}`;
+    } catch {
+        return '';
+    }
+}
+
 /**
  * 解析代理URL并返回相应的代理配置
  * @param {string} proxyUrl - 代理URL，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
@@ -26,6 +45,9 @@ export function parseProxyUrl(proxyUrl) {
     try {
         const url = new URL(trimmedUrl);
         const protocol = url.protocol.toLowerCase();
+        const host = url.hostname || null;
+        const port = url.port ? Number.parseInt(url.port, 10) : null;
+        const maskedUrl = maskProxyUrl(trimmedUrl) || '[invalid proxy url]';
 
         if (protocol === 'socks5:' || protocol === 'socks4:' || protocol === 'socks:') {
             // SOCKS 代理
@@ -33,14 +55,20 @@ export function parseProxyUrl(proxyUrl) {
             return {
                 httpAgent: socksAgent,
                 httpsAgent: socksAgent,
-                proxyType: 'socks'
+                proxyType: 'socks',
+                proxyHost: host,
+                proxyPort: Number.isFinite(port) ? port : null,
+                maskedUrl
             };
         } else if (protocol === 'http:' || protocol === 'https:') {
             // HTTP/HTTPS 代理
             return {
                 httpAgent: new HttpProxyAgent(trimmedUrl),
                 httpsAgent: new HttpsProxyAgent(trimmedUrl),
-                proxyType: 'http'
+                proxyType: 'http',
+                proxyHost: host,
+                proxyPort: Number.isFinite(port) ? port : null,
+                maskedUrl
             };
         } else {
             logger.warn(`[Proxy] Unsupported proxy protocol: ${protocol}`);
@@ -50,6 +78,81 @@ export function parseProxyUrl(proxyUrl) {
         logger.error(`[Proxy] Failed to parse proxy URL: ${error.message}`);
         return null;
     }
+}
+
+/**
+ * Returns the effective proxy URL for a provider with a stable "source" label.
+ * This never returns credentials, only the raw URL (caller should mask before display).
+ *
+ * @param {Object} config - merged config (global + node config)
+ * @param {string} providerType
+ * @returns {{proxyUrl: string|null, source: ('node'|'global'|null), explicitlyDisabled: boolean}}
+ */
+export function getEffectiveProxyUrl(config, providerType) {
+    // Node-level override semantics:
+    // - NODE_PROXY_URL_PRESENT=true and NODE_PROXY_URL='' means explicit disable
+    if (config?.NODE_PROXY_URL_PRESENT === true) {
+        const raw = safeString(config.NODE_PROXY_URL).trim();
+        if (!raw) {
+            return { proxyUrl: null, source: 'node', explicitlyDisabled: true };
+        }
+        return { proxyUrl: raw, source: 'node', explicitlyDisabled: false };
+    }
+
+    if (!isProxyEnabledForProvider(config, providerType)) {
+        return { proxyUrl: null, source: null, explicitlyDisabled: false };
+    }
+
+    const raw = safeString(config?.PROXY_URL).trim();
+    if (!raw) {
+        return { proxyUrl: null, source: null, explicitlyDisabled: false };
+    }
+
+    return { proxyUrl: raw, source: 'global', explicitlyDisabled: false };
+}
+
+/**
+ * Safe proxy summary for logs/UI: never includes userinfo credentials.
+ * @param {Object} config - merged config (global + node config)
+ * @param {string} providerType
+ * @returns {{enabled: boolean, source: ('node'|'global'|null), proxyType: string|null, host: string|null, port: number|null, maskedUrl: string, explicitlyDisabled: boolean}}
+ */
+export function getProxySummary(config, providerType) {
+    const effective = getEffectiveProxyUrl(config, providerType);
+    if (!effective.proxyUrl) {
+        return {
+            enabled: false,
+            source: effective.source,
+            proxyType: null,
+            host: null,
+            port: null,
+            maskedUrl: '',
+            explicitlyDisabled: effective.explicitlyDisabled
+        };
+    }
+
+    const parsed = parseProxyUrl(effective.proxyUrl);
+    if (!parsed) {
+        return {
+            enabled: true,
+            source: effective.source,
+            proxyType: null,
+            host: null,
+            port: null,
+            maskedUrl: maskProxyUrl(effective.proxyUrl) || '',
+            explicitlyDisabled: effective.explicitlyDisabled
+        };
+    }
+
+    return {
+        enabled: true,
+        source: effective.source,
+        proxyType: parsed.proxyType || null,
+        host: parsed.proxyHost || null,
+        port: Number.isFinite(parsed.proxyPort) ? parsed.proxyPort : null,
+        maskedUrl: parsed.maskedUrl || maskProxyUrl(effective.proxyUrl) || '',
+        explicitlyDisabled: effective.explicitlyDisabled
+    };
 }
 
 /**
@@ -89,20 +192,9 @@ export function getProxyConfigForProvider(config, providerType) {
 
         const proxyConfig = parseProxyUrl(trimmed);
         if (proxyConfig) {
-            const maskedUrl = (() => {
-                try {
-                    const url = new URL(trimmed);
-                    if (url.username || url.password) {
-                        url.username = url.username ? '***' : '';
-                        url.password = url.password ? '***' : '';
-                    }
-                    return url.toString();
-                } catch {
-                    return '[invalid proxy url]';
-                }
-            })();
-            logger.info(`[Proxy] Using node ${proxyConfig.proxyType} proxy for ${providerType}: ${maskedUrl}`);
+            logger.info(`[Proxy] Using node ${proxyConfig.proxyType} proxy for ${providerType}: ${proxyConfig.maskedUrl || maskProxyUrl(trimmed)}`);
         }
+        if (proxyConfig) proxyConfig.proxySource = 'node';
         return proxyConfig;
     }
 
@@ -112,20 +204,9 @@ export function getProxyConfigForProvider(config, providerType) {
 
     const proxyConfig = parseProxyUrl(config.PROXY_URL);
     if (proxyConfig) {
-        const maskedUrl = (() => {
-            try {
-                const url = new URL(String(config.PROXY_URL).trim());
-                if (url.username || url.password) {
-                    url.username = url.username ? '***' : '';
-                    url.password = url.password ? '***' : '';
-                }
-                return url.toString();
-            } catch {
-                return '[invalid proxy url]';
-            }
-        })();
-        logger.info(`[Proxy] Using ${proxyConfig.proxyType} proxy for ${providerType}: ${maskedUrl}`);
+        logger.info(`[Proxy] Using ${proxyConfig.proxyType} proxy for ${providerType}: ${proxyConfig.maskedUrl || maskProxyUrl(config.PROXY_URL)}`);
     }
+    if (proxyConfig) proxyConfig.proxySource = 'global';
     return proxyConfig;
 }
 

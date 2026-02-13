@@ -701,6 +701,28 @@ function formatRiskSelectionPreview(preview) {
         modeSummary
     ];
 
+    const nextAvailableAt = preview.nextAvailableAt || null;
+    if (nextAvailableAt) {
+        lines.push(`${t('modal.provider.risk.preview.nextAvailableAt')}: ${nextAvailableAt}`);
+    }
+
+    const excluded = (preview.excludedCounts && typeof preview.excludedCounts === 'object')
+        ? preview.excludedCounts
+        : null;
+    if (excluded) {
+        const excludedLine = [
+            `${t('modal.provider.risk.preview.excluded')}:`,
+            `${t('modal.provider.risk.preview.excluded.disabled')}: ${excluded.disabled || 0}`,
+            `${t('modal.provider.risk.preview.excluded.unhealthy')}: ${excluded.unhealthy || 0}`,
+            `${t('modal.provider.risk.preview.excluded.needsRefresh')}: ${excluded.needsRefresh || 0}`,
+            `${t('modal.provider.risk.preview.excluded.draining')}: ${excluded.draining || 0}`,
+            `${t('modal.provider.risk.preview.excluded.coolingDown')}: ${excluded.coolingDown || 0}`,
+            `${t('modal.provider.risk.preview.excluded.blockedByRiskPolicy')}: ${excluded.blockedByRiskPolicy || 0}`,
+            `${t('modal.provider.risk.preview.excluded.modelNotSupported')}: ${excluded.modelNotSupported || 0}`
+        ].join(' | ');
+        lines.push(excludedLine);
+    }
+
     const top = Array.isArray(preview.candidates) ? preview.candidates : [];
     if (top.length > 0) {
         lines.push(`${t('modal.provider.risk.preview.topCandidates')}:`);
@@ -959,6 +981,9 @@ function renderProviderList(providers) {
                             <i class="fas fa-id-card"></i>
                         </button>
                         ` : ''}
+                        <button class="btn-small btn-proxy-test" onclick="window.testProviderProxy('${provider.uuid}', event)" title="${t('modal.provider.proxy.testBtn')}">
+                            <i class="fas fa-network-wired"></i>
+                        </button>
                         <button class="btn-small btn-risk-info" onclick="window.showRiskReleaseInfo('${provider.uuid}', event)" title="${t('modal.provider.risk.infoBtn')}">
                             <i class="fas fa-shield-alt"></i> <span data-i18n="modal.provider.risk.infoBtn">${t('modal.provider.risk.infoBtn')}</span>
                         </button>
@@ -2185,10 +2210,24 @@ async function inspectKiroAccount(uuid, event) {
                             <div><strong>UUID:</strong> ${escapeHtml(String(data?.uuid || uuid))}</div>
                             <div><strong>Name:</strong> ${escapeHtml(String(node?.customName || ''))}</div>
                             <div><strong>Account ID:</strong> ${escapeHtml(String(node?.accountId || ''))}</div>
+                            <div><strong>Identity Email:</strong> ${escapeHtml(String(node?.identityEmail || ''))}</div>
+                            <div><strong>Identity Status:</strong> ${escapeHtml(String(node?.identityStatus || ''))}</div>
+                            <div><strong>Identity Synced:</strong> ${escapeHtml(String(node?.identityResolvedAt || ''))}</div>
                             <div><strong>Machine ID:</strong> ${escapeHtml(String(node?.machineId || ''))}</div>
+                            <div><strong>Machine FP:</strong> ${escapeHtml(String(node?.machineIdFingerprint || ''))}</div>
                             <div><strong>Proxy:</strong> ${escapeHtml(String(node?.proxy || ''))}</div>
+                            <div><strong>Endpoint:</strong> ${escapeHtml(String(node?.kiroLastEndpoint || ''))}</div>
+                            <div><strong>Endpoint At:</strong> ${escapeHtml(String(node?.kiroLastEndpointAt || ''))}</div>
+                            <div><strong>Failover Used:</strong> ${escapeHtml(String(node?.kiroEndpointFailoverUsed || false))}</div>
+                            <div><strong>Failover At:</strong> ${escapeHtml(String(node?.kiroEndpointFailoverLastAt || ''))}</div>
                             <div><strong>Healthy:</strong> ${escapeHtml(String(node?.isHealthy))}</div>
                             <div><strong>Needs Refresh:</strong> ${escapeHtml(String(node?.needsRefresh))}</div>
+                            <div><strong>Refresh Count:</strong> ${escapeHtml(String(node?.refreshCount ?? ''))}</div>
+                            <div><strong>Auth Failures:</strong> ${escapeHtml(String(node?.authFailureStreak ?? ''))}</div>
+                            <div><strong>Last Refresh:</strong> ${escapeHtml(String(node?.lastRefreshAttemptAt || ''))}</div>
+                            <div><strong>Last Success:</strong> ${escapeHtml(String(node?.lastSuccessAt || ''))}</div>
+                            <div><strong>Cooldown Until:</strong> ${escapeHtml(String(node?.cooldownUntil || ''))}</div>
+                            <div><strong>Cooldown Reason:</strong> ${escapeHtml(String(node?.cooldownReasonCode || ''))}</div>
                             ${node?.lastError ? `<div><strong>Last Error:</strong> <span title="${escapeHtml(String(node.lastError))}">${escapeHtml(String(node.lastError))}</span></div>` : ''}
                         </div>
                         <div style="padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px;">
@@ -2200,8 +2239,11 @@ async function inspectKiroAccount(uuid, event) {
                             <div><strong>Expires At:</strong> ${escapeHtml(String(cred.expiresAt || ''))}</div>
                             <div><strong>Expires In:</strong> ${escapeHtml(expiresInText)}</div>
                             <div><strong>Access Token:</strong> ${escapeHtml(String(cred.accessToken || ''))}</div>
+                            <div><strong>Access FP:</strong> ${escapeHtml(String(cred.accessTokenFingerprint || ''))}</div>
                             <div><strong>Refresh Token:</strong> ${escapeHtml(String(cred.refreshToken || ''))}</div>
+                            <div><strong>Refresh FP:</strong> ${escapeHtml(String(cred.refreshTokenFingerprint || ''))}</div>
                             <div><strong>Client ID:</strong> ${escapeHtml(String(cred.clientId || ''))}</div>
+                            <div><strong>Client FP:</strong> ${escapeHtml(String(cred.clientIdFingerprint || ''))}</div>
                             <div><strong>Profile ARN:</strong> ${escapeHtml(String(cred.profileArn || ''))}</div>
                         </div>
                         <div style="grid-column: 1 / -1; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px;">
@@ -2234,6 +2276,32 @@ async function inspectKiroAccount(uuid, event) {
     } catch (error) {
         console.error('Inspect Kiro account failed:', error);
         showToast(t('common.error'), `${t('modal.provider.kiro.inspectFailed')}: ${error.message}`, 'error');
+    }
+}
+
+async function testProviderProxy(uuid, event) {
+    event?.stopPropagation?.();
+
+    try {
+        showToast(t('common.info'), t('modal.provider.proxy.testRunning'), 'info');
+        const data = await window.apiClient.post('/proxy/test', {
+            providerType: currentProviderType,
+            uuid
+        });
+
+        if (!data?.ok) {
+            throw new Error(data?.error?.message || 'Proxy test failed');
+        }
+
+        const proxy = data?.proxy;
+        const observedIp = data?.result?.observedIp || '-';
+        const proxyLabel = proxy?.enabled
+            ? (proxy?.maskedUrl || t('modal.provider.proxy.enabled'))
+            : (proxy?.explicitlyDisabled ? t('modal.provider.proxy.disabled') : t('modal.provider.proxy.none'));
+
+        showToast(t('common.success'), `${t('modal.provider.proxy.testOk')}: ${proxyLabel} -> ${observedIp}`, 'success');
+    } catch (error) {
+        showToast(t('common.error'), `${t('modal.provider.proxy.testFailed')}: ${error.message}`, 'error');
     }
 }
 
@@ -2924,7 +2992,8 @@ export {
     refreshProviderUuid,
     openBitBrowserProfile,
     startKiroIsolatedOAuth,
-    inspectKiroAccount
+    inspectKiroAccount,
+    testProviderProxy
 };
 
 // 将函数挂载到window对象
@@ -2949,3 +3018,4 @@ window.refreshProviderUuid = refreshProviderUuid;
 window.openBitBrowserProfile = openBitBrowserProfile;
 window.startKiroIsolatedOAuth = startKiroIsolatedOAuth;
 window.inspectKiroAccount = inspectKiroAccount;
+window.testProviderProxy = testProviderProxy;

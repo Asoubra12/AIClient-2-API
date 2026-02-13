@@ -408,9 +408,21 @@ export async function getApiService(config, requestedModel = null, options = {})
             const customNameDisplay = serviceConfig.customName ? ` (${serviceConfig.customName})` : '';
             logger.info(`[API Service] Using pooled configuration for ${config.MODEL_PROVIDER}: ${serviceConfig.uuid}${customNameDisplay}${requestedModel ? ` (model: ${requestedModel})` : ''}`);
         } else {
-            const errorMsg = `[API Service] No healthy provider found in pool for ${config.MODEL_PROVIDER}${requestedModel ? ` supporting model: ${requestedModel}` : ''}`;
-            logger.error(errorMsg);
-            throw new Error(errorMsg);
+            const preview = typeof providerPoolManager.getSelectionPreview === 'function'
+                ? providerPoolManager.getSelectionPreview(config.MODEL_PROVIDER, requestedModel, { maxCandidates: 10 })
+                : null;
+            const nextAt = preview?.nextAvailableAt || null;
+            const excluded = preview?.excludedCounts || null;
+            const errorMsg = `[API Service] No healthy provider found in pool for ${config.MODEL_PROVIDER}${requestedModel ? ` supporting model: ${requestedModel}` : ''}${nextAt ? ` (nextAvailableAt=${nextAt})` : ''}`;
+            logger.error(errorMsg, excluded ? { excludedCounts: excluded } : '');
+            const err = new Error(errorMsg);
+            err.noProviderAvailable = {
+                providerType: config.MODEL_PROVIDER,
+                requestedModel: requestedModel || null,
+                nextAvailableAt: nextAt,
+                excludedCounts: excluded
+            };
+            throw err;
         }
     }
     assertRiskAdmission(serviceConfig.MODEL_PROVIDER || config.MODEL_PROVIDER, serviceConfig);
@@ -465,9 +477,21 @@ export async function getApiServiceWithFallback(config, requestedModel = null, o
                 serviceConfig.MODEL_PROVIDER = actualProviderType;
             }
         } else {
-            const errorMsg = `[API Service] No healthy provider found in pool (including fallback) for ${config.MODEL_PROVIDER}${requestedModel ? ` supporting model: ${requestedModel}` : ''}`;
-            logger.error(errorMsg);
-            throw new Error(errorMsg);
+            const preview = typeof providerPoolManager.getSelectionPreview === 'function'
+                ? providerPoolManager.getSelectionPreview(config.MODEL_PROVIDER, requestedModel, { maxCandidates: 10 })
+                : null;
+            const nextAt = preview?.nextAvailableAt || null;
+            const excluded = preview?.excludedCounts || null;
+            const errorMsg = `[API Service] No healthy provider found in pool (including fallback) for ${config.MODEL_PROVIDER}${requestedModel ? ` supporting model: ${requestedModel}` : ''}${nextAt ? ` (nextAvailableAt=${nextAt})` : ''}`;
+            logger.error(errorMsg, excluded ? { excludedCounts: excluded } : '');
+            const err = new Error(errorMsg);
+            err.noProviderAvailable = {
+                providerType: config.MODEL_PROVIDER,
+                requestedModel: requestedModel || null,
+                nextAvailableAt: nextAt,
+                excludedCounts: excluded
+            };
+            throw err;
         }
     }
     assertRiskAdmission(actualProviderType || serviceConfig.MODEL_PROVIDER || config.MODEL_PROVIDER, serviceConfig);

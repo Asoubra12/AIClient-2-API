@@ -11,7 +11,7 @@ import { EventEmitter } from 'events';
 import { randomUUID } from 'node:crypto';
 import { getProviderModels } from '../provider-models.js';
 import { handleQwenOAuth } from '../../auth/oauth-handlers.js';
-import { configureAxiosProxy } from '../../utils/proxy-utils.js';
+import { configureAxiosProxy, getEffectiveProxyUrl, maskProxyUrl } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
 
@@ -49,50 +49,6 @@ export const qwenOAuth2Events = new EventEmitter();
 
 
 // --- Helper Functions ---
-
-// 封装公共的 await fetch 方法
-async function commonFetch(url, options = {}, useSystemProxy = false) {
-    const defaultOptions = {
-        method: 'GET',
-        headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-        },
-    };
-
-    // 合并默认选项和传入的选项
-    const mergedOptions = {
-        ...defaultOptions,
-        ...options,
-        headers: {
-            ...defaultOptions.headers,
-            ...options.headers,
-        },
-    };
-
-    // 如果不使用系统代理,设置空的代理配置
-    // 注意: Node.js 的 fetch 实现会自动使用环境变量中的代理设置
-    // 这里通过设置 agent 为 null 来尝试禁用代理
-    if (!useSystemProxy && typeof mergedOptions.agent === 'undefined') {
-        // 对于 Node.js fetch,我们可以通过设置 dispatcher 来控制代理
-        // 但这需要 undici 支持,这里我们先记录日志
-        logger.debug('[Qwen] System proxy disabled for fetch request');
-    }
-
-    const response = await fetch(url, mergedOptions);
-
-    // 检查响应是否成功
-    if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        const error = new Error(`HTTP ${response.status}: ${response.statusText}`);
-        error.status = response.status;
-        error.data = errorData;
-        throw error;
-    }
-
-    // 返回 JSON 响应
-    return await response.json();
-}
 
 function generateCodeVerifier() {
     return crypto.randomBytes(32).toString('base64url');
@@ -1000,10 +956,79 @@ class QwenOAuth2Client {
         const oauthBaseUrl = config.QWEN_OAUTH_BASE_URL || DEFAULT_QWEN_OAUTH_BASE_URL;
         this.oauthDeviceCodeEndpoint = `${oauthBaseUrl}/api/v1/oauth2/device/code`;
         this.oauthTokenEndpoint = `${oauthBaseUrl}/api/v1/oauth2/token`;
+
+        // OAuth calls must honor the same proxy semantics as API calls (node override/global provider proxy).
+        const httpAgent = new http.Agent({
+            keepAlive: true,
+            maxSockets: 50,
+            maxFreeSockets: 5,
+            timeout: 30000,
+        });
+        const httpsAgent = new https.Agent({
+            keepAlive: true,
+            maxSockets: 50,
+            maxFreeSockets: 5,
+            timeout: 30000,
+        });
+
+        const axiosConfig = {
+            timeout: 30000,
+            httpAgent,
+            httpsAgent,
+        };
+        if (!this.useSystemProxy) {
+            axiosConfig.proxy = false;
+        }
+        configureAxiosProxy(axiosConfig, this.config, MODEL_PROVIDER.QWEN_API);
+        this.axiosOAuth = axios.create(axiosConfig);
     }
 
     setCredentials(credentials) { this.credentials = credentials; }
     getCredentials() { return this.credentials; }
+
+    _proxyMetaForLog() {
+        try {
+            const effective = getEffectiveProxyUrl(this.config, MODEL_PROVIDER.QWEN_API);
+            if (!effective?.proxyUrl) {
+                return {
+                    enabled: false,
+                    source: effective?.source || null,
+                    explicitlyDisabled: effective?.explicitlyDisabled === true,
+                    maskedUrl: ''
+                };
+            }
+            return {
+                enabled: true,
+                source: effective.source || null,
+                explicitlyDisabled: effective.explicitlyDisabled === true,
+                maskedUrl: maskProxyUrl(effective.proxyUrl) || ''
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    async _postForm(endpoint, bodyData) {
+        try {
+            const response = await this.axiosOAuth.post(
+                endpoint,
+                objectToUrlEncoded(bodyData),
+                {
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        Accept: 'application/json'
+                    },
+                    timeout: 30000
+                }
+            );
+            return response?.data;
+        } catch (error) {
+            const err = new Error(error?.message || 'OAuth request failed');
+            err.status = error?.response?.status;
+            err.data = error?.response?.data;
+            throw err;
+        }
+    }
 
     async refreshAccessToken() {
         if (!this.credentials.refresh_token) throw new Error('No refresh token');
@@ -1014,11 +1039,10 @@ class QwenOAuth2Client {
         };
         try {
             const endpoint = this.oauthTokenEndpoint;
-            const response = await commonFetch(endpoint, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-                body: objectToUrlEncoded(bodyData),
-            }, this.useSystemProxy);
+            logger.info('[Qwen Auth] Refresh request meta', {
+                proxy: this._proxyMetaForLog()
+            });
+            const response = await this._postForm(endpoint, bodyData);
             return response;
         } catch (error) {
             const errorData = error.data || {};
@@ -1045,11 +1069,7 @@ class QwenOAuth2Client {
         };
         try {
             const endpoint = this.oauthDeviceCodeEndpoint;
-            const response = await commonFetch(endpoint, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-                body: objectToUrlEncoded(bodyData),
-            }, this.useSystemProxy);
+            const response = await this._postForm(endpoint, bodyData);
             return response;
         } catch (error) {
             throw new Error(`Device authorization failed: ${error.status || error.message}`);
@@ -1065,11 +1085,7 @@ class QwenOAuth2Client {
         };
         try {
             const endpoint = this.oauthTokenEndpoint;
-            const response = await commonFetch(endpoint, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-                body: objectToUrlEncoded(bodyData),
-            }, this.useSystemProxy);
+            const response = await this._postForm(endpoint, bodyData);
             return response;
         } catch (error) {
             // 根据 OAuth RFC 8628,处理标准轮询响应
@@ -1097,4 +1113,3 @@ class QwenOAuth2Client {
         }
     }
 }
-
