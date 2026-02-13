@@ -6,7 +6,7 @@ jest.mock('open', () => ({
 }));
 
 // Now import the module under test
-import { createRequestHandler } from '../src/request-handler.js';
+import { createRequestHandler } from '../src/handlers/request-handler.js';
 
 describe('CORS Configuration', () => {
     let mockConfig;
@@ -54,8 +54,8 @@ describe('CORS Configuration', () => {
         }
 
         expect(headers['Access-Control-Allow-Origin']).toBe('*');
-        expect(headers['Access-Control-Allow-Methods']).toBe('GET, POST, PUT, DELETE, OPTIONS');
-        expect(headers['Access-Control-Allow-Headers']).toBe('Content-Type, Authorization, x-goog-api-key, Model-Provider');
+        expect(headers['Access-Control-Allow-Methods']).toBe('GET, POST, PUT, DELETE, OPTIONS, PATCH');
+        expect(headers['Access-Control-Allow-Headers']).toBe('Content-Type, Authorization, x-goog-api-key, Model-Provider, X-Requested-With, Accept, Origin');
     });
 
     test('should set CORS headers for OPTIONS requests', async () => {
@@ -85,7 +85,7 @@ describe('CORS Configuration', () => {
         }
 
         expect(headers['Access-Control-Allow-Origin']).toBe('*');
-        expect(headers['Access-Control-Allow-Methods']).toBe('GET, POST, PUT, DELETE, OPTIONS');
-        expect(headers['Access-Control-Allow-Headers']).toBe('Content-Type, Authorization, x-goog-api-key, Model-Provider');
+        expect(headers['Access-Control-Allow-Methods']).toBe('GET, POST, PUT, DELETE, OPTIONS, PATCH');
+        expect(headers['Access-Control-Allow-Headers']).toBe('Content-Type, Authorization, x-goog-api-key, Model-Provider, X-Requested-With, Accept, Origin');
     });
 });

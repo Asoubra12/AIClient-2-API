@@ -97,7 +97,15 @@ describe('Kiro machineId resolution and header consistency', () => {
 
         await service.getUsageLimits();
 
-        const expectedMachineId = crypto.createHash('sha256').update(nodeUuid).digest('hex');
+        // Mirror generateMachineIdFromConfig() behavior (stable UUID derived from sha256(uuid)).
+        const hash = crypto.createHash('sha256').update(nodeUuid).digest('hex').slice(0, 32);
+        const chars = hash.split('');
+        chars[12] = '4'; // RFC 4122 version 4
+        const variantNibble = Number.parseInt(chars[16], 16);
+        chars[16] = ['8', '9', 'a', 'b'][Number.isFinite(variantNibble) ? (variantNibble % 4) : 0];
+        const normalized = chars.join('');
+        const expectedMachineId =
+            `${normalized.slice(0, 8)}-${normalized.slice(8, 12)}-${normalized.slice(12, 16)}-${normalized.slice(16, 20)}-${normalized.slice(20)}`;
         const headers = service.axiosInstance.get.mock.calls[0][1].headers;
         expect(headers['x-amz-user-agent']).toContain(expectedMachineId);
         expect(headers['user-agent']).toContain(expectedMachineId);

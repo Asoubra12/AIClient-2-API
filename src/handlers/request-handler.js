@@ -196,7 +196,31 @@ export function createRequestHandler(config, providerPoolManager) {
         // 获取或选择 API Service 实例
         let apiService;
         try {
-            apiService = await getApiService(currentConfig);
+            // IMPORTANT: Avoid double-selection for pooled providers.
+            // Content-generation handlers select a provider again after reading the body (to know the model),
+            // which can cause mid-request provider switching and incorrect LRU/usage metrics.
+            //
+            // Strategy:
+            // - If we are in pooled mode for the current MODEL_PROVIDER and this is a content-generation route,
+            //   defer service selection to the content-generation handler (after parsing the request body).
+            // - Otherwise, select service here as before.
+            const isContentGenerationRoute =
+                method === 'POST' && (
+                    path === '/v1/chat/completions' ||
+                    path === '/v1/responses' ||
+                    path === '/v1/messages' ||
+                    new RegExp(`/v1beta/models/(.+?):(.+)$`).test(path)
+                );
+            const hasPoolForType =
+                !!providerPoolManager &&
+                !!currentConfig?.providerPools &&
+                !!currentConfig?.providerPools?.[currentConfig.MODEL_PROVIDER];
+
+            if (isContentGenerationRoute && hasPoolForType) {
+                apiService = null; // Will be selected inside handleContentGenerationRequest().
+            } else {
+                apiService = await getApiService(currentConfig);
+            }
         } catch (error) {
             handleError(res, { statusCode: 500, message: `Failed to get API service: ${error.message}` }, currentConfig.MODEL_PROVIDER);
             const poolManager = getProviderPoolManager();

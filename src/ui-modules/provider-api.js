@@ -17,11 +17,12 @@ export async function handleGetProviders(req, res, currentConfig, providerPoolMa
     let providerPools = {};
     const filePath = currentConfig.PROVIDER_POOLS_FILE_PATH || 'configs/provider_pools.json';
     try {
-        if (providerPoolManager && providerPoolManager.providerPools) {
+        // Prefer disk as the source of truth.
+        // In cluster/multi-worker deployments, in-memory providerPools can be stale across workers.
+        if (filePath && existsSync(filePath)) {
+            providerPools = JSON.parse(readFileSync(filePath, 'utf-8'));
+        } else if (providerPoolManager && providerPoolManager.providerPools) {
             providerPools = providerPoolManager.providerPools;
-        } else if (filePath && existsSync(filePath)) {
-            const poolsData = JSON.parse(readFileSync(filePath, 'utf-8'));
-            providerPools = poolsData;
         }
     } catch (error) {
         logger.warn('[UI API] Failed to load provider pools:', error.message);
@@ -39,11 +40,11 @@ export async function handleGetProviderType(req, res, currentConfig, providerPoo
     let providerPools = {};
     const filePath = currentConfig.PROVIDER_POOLS_FILE_PATH || 'configs/provider_pools.json';
     try {
-        if (providerPoolManager && providerPoolManager.providerPools) {
+        // Prefer disk as the source of truth.
+        if (filePath && existsSync(filePath)) {
+            providerPools = JSON.parse(readFileSync(filePath, 'utf-8'));
+        } else if (providerPoolManager && providerPoolManager.providerPools) {
             providerPools = providerPoolManager.providerPools;
-        } else if (filePath && existsSync(filePath)) {
-            const poolsData = JSON.parse(readFileSync(filePath, 'utf-8'));
-            providerPools = poolsData;
         }
     } catch (error) {
         logger.warn('[UI API] Failed to load provider pools:', error.message);
@@ -1127,13 +1128,7 @@ function buildKiroUsageHeaders(accessToken, machineId) {
 }
 
 function selectProviderConfig(providerPoolManager, providerType, uuid, currentConfig) {
-    if (providerPoolManager?.providerPools?.[providerType]) {
-        const list = providerPoolManager.providerPools[providerType];
-        const found = Array.isArray(list) ? list.find((p) => p && p.uuid === uuid) : null;
-        if (found) return found;
-    }
-
-    // Fallback: load from file (matches handleGetProviderType behavior)
+    // Prefer disk as the source of truth.
     const filePath = currentConfig?.PROVIDER_POOLS_FILE_PATH || 'configs/provider_pools.json';
     if (filePath && existsSync(filePath)) {
         try {
@@ -1142,6 +1137,13 @@ function selectProviderConfig(providerPoolManager, providerType, uuid, currentCo
             const found = Array.isArray(list) ? list.find((p) => p && p.uuid === uuid) : null;
             if (found) return found;
         } catch {}
+    }
+
+    // Fallback: in-memory pools (may be stale across workers)
+    if (providerPoolManager?.providerPools?.[providerType]) {
+        const list = providerPoolManager.providerPools[providerType];
+        const found = Array.isArray(list) ? list.find((p) => p && p.uuid === uuid) : null;
+        if (found) return found;
     }
     return null;
 }
