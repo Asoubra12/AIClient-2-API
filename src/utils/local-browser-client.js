@@ -37,6 +37,52 @@ function splitCommandLineArgs(value) {
     return raw.split(/\s+/).filter(Boolean);
 }
 
+function isLikelyChromiumProfileInUse(profileDir) {
+    const dir = normalizeString(profileDir);
+    if (!dir) return false;
+
+    try {
+        const out = spawnSync('ps', ['-eo', 'pid,args'], { encoding: 'utf8' });
+        if (out.status !== 0) return false;
+        const haystack = String(out.stdout || '');
+
+        // Best-effort match for Chromium/Chrome using this exact user-data-dir.
+        // This avoids deleting Singleton* artifacts while a real browser is running.
+        const escaped = dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(`\\b(chromium|chrome)\\b[^\\n]*--user-data-dir(=|\\s+)("?${escaped}"?)`, 'i');
+        return re.test(haystack);
+    } catch {
+        return false;
+    }
+}
+
+async function cleanupChromiumSingletonArtifacts(profileDir) {
+    const dir = normalizeString(profileDir);
+    if (!dir) return { cleaned: false, skipped: false };
+
+    if (isLikelyChromiumProfileInUse(dir)) {
+        return { cleaned: false, skipped: true, reason: 'profile_in_use' };
+    }
+
+    const singletonNames = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+    let cleaned = false;
+
+    for (const name of singletonNames) {
+        const filePath = path.join(dir, name);
+        try {
+            // Only remove if it exists (including stale symlinks).
+            await fs.lstat(filePath);
+            await fs.unlink(filePath);
+            cleaned = true;
+        } catch (e) {
+            if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) continue;
+            // Don't hard-fail launching Chromium due to cleanup problems.
+        }
+    }
+
+    return { cleaned, skipped: false };
+}
+
 function normalizeProxyInput(value) {
     let raw = normalizeString(value);
     if (!raw) return '';
@@ -226,6 +272,15 @@ export async function openLocalBrowser({
     if (!normalizedProfileDir) {
         throw new Error('profileDir is required');
     }
+
+    // Chromium can leave stale Singleton* artifacts behind if it crashes (common in containers).
+    // Clean them up on launch to avoid "profile appears to be in use" and immediate exit.
+    try {
+        const cleanup = await cleanupChromiumSingletonArtifacts(normalizedProfileDir);
+        if (cleanup.cleaned) {
+            logger.info('[IsolatedBrowser] Cleaned stale Chromium profile singleton artifacts before launch.');
+        }
+    } catch {}
 
     const chromiumProxy = parseProxyForChromium(normalizedProxyUrl);
 
