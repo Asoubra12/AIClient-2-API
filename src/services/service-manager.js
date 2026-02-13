@@ -282,6 +282,12 @@ async function scanProviderDirectory(dirPath, linkedPaths, newProviders, options
 export async function initApiService(config, isReady = false) {
     initializeRiskManager(config, config.providerPools || {});
 
+    // Avoid scheduling multiple refresh loops if initApiService is called more than once.
+    // This module is a singleton in the server process, so a single interval is sufficient.
+    if (!globalThis.__aiclient_expiring_nodes_refresh_interval) {
+        globalThis.__aiclient_expiring_nodes_refresh_interval = null;
+    }
+
     if (config.providerPools && Object.keys(config.providerPools).length > 0) {
         providerPoolManager = new ProviderPoolManager(config.providerPools, {
             globalConfig: config,
@@ -301,6 +307,30 @@ export async function initApiService(config, isReady = false) {
             providerPoolManager.checkAndRefreshExpiringNodes().catch(err => {
                 logger.error(`[Initialization] Check and refresh expiring nodes failed: ${err.message}`);
             });
+
+            // Continuously scan for expiring credentials (pool-wide), not just at startup.
+            // Defaults to 10 minutes; can be overridden via REFRESH_EXPIRING_NODES_INTERVAL_MS.
+            const intervalMs = Number.isFinite(Number(config.REFRESH_EXPIRING_NODES_INTERVAL_MS))
+                ? Math.max(60 * 1000, Number(config.REFRESH_EXPIRING_NODES_INTERVAL_MS))
+                : 10 * 60 * 1000;
+            try {
+                if (globalThis.__aiclient_expiring_nodes_refresh_interval) {
+                    clearInterval(globalThis.__aiclient_expiring_nodes_refresh_interval);
+                }
+                globalThis.__aiclient_expiring_nodes_refresh_interval = setInterval(() => {
+                    try {
+                        providerPoolManager?.checkAndRefreshExpiringNodes?.().catch(err => {
+                            logger.error(`[Refresh Loop] Check and refresh expiring nodes failed: ${err.message}`);
+                        });
+                    } catch (err) {
+                        logger.error(`[Refresh Loop] Failed to schedule expiring node refresh: ${err.message}`);
+                    }
+                }, intervalMs);
+                globalThis.__aiclient_expiring_nodes_refresh_interval.unref?.();
+                logger.info(`[Initialization] Scheduled expiring credential scan every ${Math.round(intervalMs / 1000)}s.`);
+            } catch (err) {
+                logger.error(`[Initialization] Failed to schedule expiring credential scan: ${err.message}`);
+            }
         }
 
         // 健康检查将在服务器完全启动后执行
