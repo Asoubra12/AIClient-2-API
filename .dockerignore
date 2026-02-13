@@ -4,6 +4,12 @@ npm-debug.log
 .gitignore
 Dockerfile
 .dockerignore
+
+# Runtime secrets / mutable state (never bake into images)
+configs/
+docker/configs/
+logs/
+
 .nyc_output
 coverage
 .nyc_output

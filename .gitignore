@@ -1,6 +1,10 @@
 node_modules
 .serena/
 .claude/
+.env
+.env.*
+docker/.env
+docker/.env.*
 CLAUDE.md
 config.json
 provider_pools.json
