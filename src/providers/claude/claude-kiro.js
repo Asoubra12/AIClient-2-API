@@ -1342,10 +1342,25 @@ async saveCredentialsToFile(filePath, newData) {
                 };
                 toolsContext = { tools: [placeholderTool] };
             } else {
+                // Kiro upstream is sensitive to oversized tool descriptions. Keep this as a hard cap.
                 const MAX_DESCRIPTION_LENGTH = 9216;
 
                 let truncatedCount = 0;
-                const kiroTools = filteredTools
+                // De-dupe by tool name (some clients resend duplicates across turns).
+                const dedupedTools = (() => {
+                    const seen = new Set();
+                    const out = [];
+                    for (const tool of filteredTools) {
+                        const name = String(tool?.name || '').trim();
+                        if (!name) continue;
+                        if (seen.has(name)) continue;
+                        seen.add(name);
+                        out.push(tool);
+                    }
+                    return out;
+                })();
+
+                const kiroTools = dedupedTools
                     .filter(tool => {
                         // 过滤掉描述为空的工具
                         if (!tool.description || tool.description.trim() === '') {
@@ -1359,7 +1374,9 @@ async saveCredentialsToFile(filePath, newData) {
                         const originalLength = desc.length;
                         
                         if (desc.length > MAX_DESCRIPTION_LENGTH) {
-                            desc = desc.substring(0, MAX_DESCRIPTION_LENGTH) + "...";
+                            // Ensure final length never exceeds MAX_DESCRIPTION_LENGTH.
+                            const headLen = Math.max(0, MAX_DESCRIPTION_LENGTH - 3);
+                            desc = desc.substring(0, headLen) + "...";
                             truncatedCount++;
                             logger.info(`[Kiro] Truncated tool '${tool.name}' description: ${originalLength} -> ${desc.length} chars`);
                         }
