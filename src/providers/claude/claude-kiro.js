@@ -1434,6 +1434,28 @@ async saveCredentialsToFile(filePath, newData) {
             toolsContext = { tools: [placeholderTool] };
         }
 
+        // Tool results (e.g., file reads) can be extremely large. Cap payload size to reduce upstream failures
+        // and pathological model behavior when clients attach too many files at once.
+        const TOOL_RESULT_MAX_CHARS = (() => {
+            const raw = Number(this.config?.KIRO_MAX_TOOL_RESULT_CHARS);
+            if (Number.isFinite(raw) && raw > 2048) return Math.floor(raw);
+            return 120000;
+        })();
+
+        const truncateToolResultText = (rawText, toolUseId = '') => {
+            const text = rawText === undefined || rawText === null ? '' : String(rawText);
+            if (text.length <= TOOL_RESULT_MAX_CHARS) return text;
+
+            const headLen = Math.max(0, Math.floor(TOOL_RESULT_MAX_CHARS * 0.8));
+            const reserved = 96; // marker overhead
+            const tailLen = Math.max(0, TOOL_RESULT_MAX_CHARS - headLen - reserved);
+            const removed = Math.max(0, text.length - headLen - tailLen);
+            const marker = `\n...[tool_result truncated: removed ${removed} chars]...\n`;
+            const out = `${text.slice(0, headLen)}${marker}${tailLen > 0 ? text.slice(-tailLen) : ''}`;
+            logger.info(`[Kiro] Truncated tool_result${toolUseId ? ` (${toolUseId})` : ''}: ${text.length} -> ${out.length} chars`);
+            return out;
+        };
+
         const history = [];
         let startIndex = 0;
 
@@ -1487,8 +1509,12 @@ async saveCredentialsToFile(filePath, newData) {
                         if (part.type === 'text') {
                             userInputMessage.content += part.text;
                         } else if (part.type === 'tool_result') {
+                            const toolText = truncateToolResultText(
+                                this.getContentText(part.content),
+                                part.tool_use_id
+                            );
                             toolResults.push({
-                                content: [{ text: this.getContentText(part.content) }],
+                                content: [{ text: toolText }],
                                 status: 'success',
                                 toolUseId: part.tool_use_id
                             });
@@ -1649,8 +1675,12 @@ async saveCredentialsToFile(filePath, newData) {
                     if (part.type === 'text') {
                         currentContent += part.text;
                     } else if (part.type === 'tool_result') {
+                        const toolText = truncateToolResultText(
+                            this.getContentText(part.content),
+                            part.tool_use_id
+                        );
                         currentToolResults.push({
-                            content: [{ text: this.getContentText(part.content) }],
+                            content: [{ text: toolText }],
                             status: 'success',
                             toolUseId: part.tool_use_id
                         });
