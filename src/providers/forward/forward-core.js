@@ -95,6 +95,8 @@ export class ForwardApiService {
     async *streamApi(endpoint, body, isRetry = false, retryCount = 0) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
+        // Avoid retrying after streaming has started; retries replay output and clients append it.
+        let yieldedAny = false;
 
         try {
             const response = await this.axiosInstance.post(endpoint, body, {
@@ -118,6 +120,7 @@ export class ForwardApiService {
                         }
                         try {
                             const parsedChunk = JSON.parse(jsonData);
+                            yieldedAny = true;
                             yield parsedChunk;
                         } catch (e) {
                             // If it's not JSON, it might be a different format, but for a forwarder we try to parse common SSE formats
@@ -131,6 +134,11 @@ export class ForwardApiService {
             const errorCode = error.code;
             const isNetworkError = isRetryableNetworkError(error);
             
+            if (yieldedAny) {
+                logger.warn(`[Forward API] Stream failed after yielding output (Status: ${status ?? 'unknown'}, Code: ${errorCode ?? 'unknown'}). Not retrying to avoid duplicate output.`);
+                throw error;
+            }
+
             if ((status === 429 || (status >= 500 && status < 600) || isNetworkError) && retryCount < maxRetries) {
                 const delay = baseDelay * Math.pow(2, retryCount);
                 logger.info(`[Forward API] Stream error ${status || errorCode}. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
@@ -176,4 +184,3 @@ export class ForwardApiService {
         }
     }
 }
-

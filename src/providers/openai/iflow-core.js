@@ -839,6 +839,8 @@ export class IFlowApiService {
     async *streamApi(endpoint, body, model, isRetry = false, retryCount = 0) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
+        // Avoid retrying after streaming has started; retries replay output and clients append it.
+        let yieldedAny = false;
 
         // 预处理请求体并设置 stream: true
         const processedBody = preprocessRequestBody({ ...body, stream: true }, model);
@@ -893,6 +895,7 @@ export class IFlowApiService {
                         
                         try {
                             const parsedChunk = JSON.parse(jsonData);
+                            yieldedAny = true;
                             yield parsedChunk;
                         } catch (e) {
                             // JSON 解析失败，记录警告但继续处理
@@ -916,6 +919,7 @@ export class IFlowApiService {
                     if (jsonData !== '[DONE]' && jsonData !== '') {
                         try {
                             const parsedChunk = JSON.parse(jsonData);
+                            yieldedAny = true;
                             yield parsedChunk;
                         } catch (e) {
                             logger.warn("[iFlow] Failed to parse final stream chunk JSON:", e.message);
@@ -954,6 +958,11 @@ export class IFlowApiService {
 
             if (status === 401 || status === 403) {
                 logger.error(`[iFlow] Received ${status} during stream. API Key might be invalid or expired.`);
+                throw error;
+            }
+
+            if (yieldedAny) {
+                logger.warn(`[iFlow] Stream failed after yielding output (Status: ${status ?? 'unknown'}, Code: ${errorCode ?? 'unknown'}). Not retrying to avoid duplicate output.`);
                 throw error;
             }
 

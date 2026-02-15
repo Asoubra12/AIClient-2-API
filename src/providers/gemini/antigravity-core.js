@@ -1169,6 +1169,8 @@ export class AntigravityApiService {
     async * streamApi(method, body, isRetry = false, retryCount = 0, baseURLIndex = 0) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
+        // Avoid retrying/failing over after streaming has started; retries replay output and clients append it.
+        let yieldedAny = false;
 
         if (baseURLIndex >= this.baseURLs.length) {
             throw new Error('All Antigravity base URLs failed');
@@ -1200,7 +1202,10 @@ export class AntigravityApiService {
                 throw new Error(`Upstream API Error (Status ${res.status}): ${errorBody}`);
             }
 
-            yield* this.parseSSEStream(res.data);
+            for await (const chunk of this.parseSSEStream(res.data)) {
+                yieldedAny = true;
+                yield chunk;
+            }
         } catch (error) {
             const status = error.response?.status;
             const errorCode = error.code;
@@ -1227,6 +1232,11 @@ export class AntigravityApiService {
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
+                throw error;
+            }
+
+            if (yieldedAny) {
+                logger.warn(`[Antigravity API] Stream failed after yielding output (Status: ${status ?? 'unknown'}, Code: ${errorCode ?? 'unknown'}). Not retrying to avoid duplicate output.`);
                 throw error;
             }
 

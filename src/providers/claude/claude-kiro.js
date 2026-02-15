@@ -2378,6 +2378,9 @@ async saveCredentialsToFile(filePath, newData) {
         if (!this.isInitialized) await this.initialize();
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
+        // If we already yielded anything to the caller, retrying would replay output from scratch and
+        // most clients will append it, causing duplicated text.
+        let yieldedAny = false;
 
         // 处理不同格式的请求体（messages 或 contents）
         let messages = body.messages;
@@ -2424,14 +2427,19 @@ async saveCredentialsToFile(filePath, newData) {
                             continue;
                         }
                         lastContentEvent = event.data;
+                        yieldedAny = true;
                         yield { type: 'content', content: event.data };
                     } else if (event.type === 'toolUse') {
+                        yieldedAny = true;
                         yield { type: 'toolUse', toolUse: event.data };
                     } else if (event.type === 'toolUseInput') {
+                        yieldedAny = true;
                         yield { type: 'toolUseInput', input: event.data.input };
                     } else if (event.type === 'toolUseStop') {
+                        yieldedAny = true;
                         yield { type: 'toolUseStop', stop: event.data.stop };
                     } else if (event.type === 'contextUsage') {
+                        yieldedAny = true;
                         yield { type: 'contextUsage', contextUsagePercentage: event.data.contextUsagePercentage };
                     }
                 }
@@ -2521,6 +2529,10 @@ async saveCredentialsToFile(filePath, newData) {
 
             // Handle network errors (ECONNRESET, ETIMEDOUT, etc.) with exponential backoff
             if (isNetworkError && retryCount < maxRetries) {
+                if (yieldedAny) {
+                    logger.warn(`[Kiro] Stream network error after yielding output (Code: ${errorCode ?? 'unknown'}). Not retrying to avoid duplicate output.`);
+                    throw error;
+                }
                 const delay = baseDelay * Math.pow(2, retryCount);
                 const errorIdentifier = errorCode || errorMessage.substring(0, 50);
                 logger.info(`[Kiro] Network error (${errorIdentifier}) in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);

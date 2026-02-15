@@ -93,6 +93,9 @@ export class OpenAIResponsesApiService {
 
         // OpenAI 的流式请求需要将 stream 设置为 true
         const streamRequestBody = { ...body, stream: true };
+        // If we've already yielded any chunk to the caller, retrying would replay output from scratch,
+        // which clients typically append, resulting in duplicated text. In that case, fail fast.
+        let yieldedAny = false;
 
         try {
             const response = await this.axiosInstance.post(endpoint, streamRequestBody, {
@@ -116,6 +119,7 @@ export class OpenAIResponsesApiService {
                         }
                         try {
                             const parsedChunk = JSON.parse(jsonData);
+                            yieldedAny = true;
                             yield parsedChunk;
                         } catch (e) {
                             logger.warn("[OpenAIResponsesApiService] Failed to parse stream chunk JSON:", e.message, "Data:", jsonData);
@@ -130,6 +134,11 @@ export class OpenAIResponsesApiService {
             const data = error.response?.data;
             if (status === 401 || status === 403) {
                 logger.error(`[API] Received ${status} during stream. API Key might be invalid or expired.`);
+                throw error;
+            }
+
+            if (yieldedAny) {
+                logger.warn(`[API] Stream failed after yielding output (Status: ${status ?? 'unknown'}). Not retrying to avoid duplicate output.`);
                 throw error;
             }
 

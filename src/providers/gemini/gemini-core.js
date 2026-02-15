@@ -543,6 +543,8 @@ export class GeminiApiService {
     async * streamApi(method, body, isRetry = false, retryCount = 0) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
+        // Avoid retrying after streaming has started; retries replay output and clients append it.
+        let yieldedAny = false;
 
         try {
             const requestOptions = {
@@ -559,7 +561,10 @@ export class GeminiApiService {
                 for await (const chunk of res.data) errorBody += chunk.toString();
                 throw new Error(`Upstream API Error (Status ${res.status}): ${errorBody}`);
             }
-            yield* this.parseSSEStream(res.data);
+            for await (const chunk of this.parseSSEStream(res.data)) {
+                yieldedAny = true;
+                yield chunk;
+            }
         } catch (error) {
             const status = error.response?.status;
             const errorCode = error.code;
@@ -587,6 +592,11 @@ export class GeminiApiService {
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
+                throw error;
+            }
+
+            if (yieldedAny) {
+                logger.warn(`[Gemini API] Stream failed after yielding output (Status: ${status ?? 'unknown'}, Code: ${errorCode ?? 'unknown'}). Not retrying to avoid duplicate output.`);
                 throw error;
             }
 
@@ -843,4 +853,3 @@ export class GeminiApiService {
         }
     }
 }
-

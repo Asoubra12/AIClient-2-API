@@ -138,6 +138,9 @@ export class ClaudeApiService {
     async *streamApi(endpoint, body, isRetry = false, retryCount = 0) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
+        // If we already streamed anything to the caller, retrying will replay output from scratch and
+        // most clients will append it, causing duplicated text.
+        let yieldedAny = false;
 
         try {
             const response = await this.client.post(endpoint, { ...body, stream: true }, { responseType: 'stream' });
@@ -162,6 +165,7 @@ export class ClaudeApiService {
                     if (data) {
                         try {
                             const parsedChunk = JSON.parse(data);
+                            yieldedAny = true;
                             yield parsedChunk;
                             if (parsedChunk.type === 'message_stop') {
                                 return;
@@ -183,6 +187,11 @@ export class ClaudeApiService {
             // 对于 Claude API，401 通常意味着 API Key 无效，不进行重试
             if (status === 401 || status === 403) {
                 logger.error(`[Claude API] Received ${status} during stream. API Key might be invalid or expired.`);
+                throw error;
+            }
+
+            if (yieldedAny) {
+                logger.warn(`[Claude API] Stream failed after yielding output (Status: ${status ?? 'unknown'}, Code: ${errorCode ?? 'unknown'}). Not retrying to avoid duplicate output.`);
                 throw error;
             }
 
@@ -273,4 +282,3 @@ export class ClaudeApiService {
         return { models: models.map(m => ({ name: m.name })) };
     }
 }
-
