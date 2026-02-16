@@ -1162,17 +1162,17 @@ function normalizeKiroUsageLimitsShape(rawData) {
 
     const usedCount = pickCount(
         data.usedCount,
-        data.totalUsage,
         preferred?.currentUsageWithPrecision,
-        preferred?.currentUsage
+        preferred?.currentUsage,
+        data.totalUsage
     );
 
     const limitCount = pickCount(
         data.limitCount,
-        data.totalLimit,
-        data.limit,
         preferred?.usageLimitWithPrecision,
-        preferred?.usageLimit
+        preferred?.usageLimit,
+        data.totalLimit,
+        data.limit
     );
 
     const nextDateReset = data.nextDateReset
