@@ -2185,6 +2185,14 @@ async function inspectKiroAccount(uuid, event) {
         const cred = data?.credentials || {};
         const usage = data?.usageLimits || {};
         const userInfo = usage?.userInfo || {};
+        const metricText = (value) => {
+            if (value === null || value === undefined || value === '') return '-';
+            const n = Number(value);
+            if (Number.isFinite(n)) {
+                return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+            }
+            return String(value);
+        };
 
         const expiresInText = cred.expiresInMs !== null && cred.expiresInMs !== undefined
             ? formatDurationMs(cred.expiresInMs)
@@ -2252,8 +2260,9 @@ async function inspectKiroAccount(uuid, event) {
                             ${usage.error ? `<div><strong>Error:</strong> ${escapeHtml(String(usage.error))}</div>` : ''}
                             <div><strong>Email:</strong> ${escapeHtml(String(userInfo.email || ''))}</div>
                             <div><strong>User ID:</strong> ${escapeHtml(String(userInfo.userId || ''))}</div>
-                            <div><strong>User Status:</strong> ${escapeHtml(String(userInfo.status || ''))}</div>
-                            <div><strong>Used / Limit:</strong> ${escapeHtml(String(usage.usedCount ?? ''))} / ${escapeHtml(String(usage.limitCount ?? ''))}</div>
+                            <div><strong>User Status:</strong> ${escapeHtml(String(userInfo.status || node?.identityStatus || ''))}</div>
+                            <div><strong>Used / Limit:</strong> ${escapeHtml(metricText(usage.usedCount))} / ${escapeHtml(metricText(usage.limitCount))}</div>
+                            <div><strong>Metric:</strong> ${escapeHtml(String(usage.resourceType || ''))}${usage.unit ? ` (${escapeHtml(String(usage.unit))})` : ''}</div>
                             <div><strong>Next Reset:</strong> ${escapeHtml(String(usage.nextDateReset ?? ''))}</div>
                         </div>
                     </div>

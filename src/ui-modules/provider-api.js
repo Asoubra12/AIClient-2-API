@@ -1127,6 +1127,76 @@ function buildKiroUsageHeaders(accessToken, machineId) {
     };
 }
 
+function normalizeKiroUsageLimitsShape(rawData) {
+    const data = rawData && typeof rawData === 'object' ? rawData : {};
+    const toFiniteNumber = (value) => {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+    };
+
+    const pickCount = (...candidates) => {
+        for (const value of candidates) {
+            const n = toFiniteNumber(value);
+            if (n !== null) return n;
+        }
+        return null;
+    };
+
+    const breakdownList = Array.isArray(data.usageBreakdownList)
+        ? data.usageBreakdownList
+        : [];
+
+    const preferred = (() => {
+        if (!breakdownList.length) return null;
+        const byPriority = breakdownList.find((item) => item && item.resourceType === 'AGENTIC_REQUEST')
+            || breakdownList.find((item) => item && item.resourceType === 'CREDIT')
+            || breakdownList.find((item) => item && (
+                toFiniteNumber(item.currentUsageWithPrecision) !== null ||
+                toFiniteNumber(item.currentUsage) !== null ||
+                toFiniteNumber(item.usageLimitWithPrecision) !== null ||
+                toFiniteNumber(item.usageLimit) !== null
+            ))
+            || breakdownList[0];
+        return byPriority && typeof byPriority === 'object' ? byPriority : null;
+    })();
+
+    const usedCount = pickCount(
+        data.usedCount,
+        data.totalUsage,
+        preferred?.currentUsageWithPrecision,
+        preferred?.currentUsage
+    );
+
+    const limitCount = pickCount(
+        data.limitCount,
+        data.totalLimit,
+        data.limit,
+        preferred?.usageLimitWithPrecision,
+        preferred?.usageLimit
+    );
+
+    const nextDateReset = data.nextDateReset
+        ?? preferred?.nextDateReset
+        ?? null;
+
+    const userInfo = data.userInfo && typeof data.userInfo === 'object'
+        ? {
+            email: data.userInfo.email || '',
+            userId: data.userInfo.userId || '',
+            status: data.userInfo.status || ''
+        }
+        : null;
+
+    return {
+        usedCount,
+        limitCount,
+        nextDateReset,
+        userInfo,
+        resourceType: preferred?.resourceType || null,
+        unit: preferred?.unit || null
+    };
+}
+
 function selectProviderConfig(providerPoolManager, providerType, uuid, currentConfig) {
     // Prefer disk as the source of truth.
     const filePath = currentConfig?.PROVIDER_POOLS_FILE_PATH || 'configs/provider_pools.json';
@@ -1330,18 +1400,15 @@ export async function handleInspectProvider(req, res, currentConfig, providerPoo
 
                 const response = await axios.get(url, axiosConfig);
                 const data = response?.data || {};
+                const normalized = normalizeKiroUsageLimitsShape(data);
                 result.usageLimits.ok = true;
                 result.usageLimits.statusCode = response?.status || 200;
-                result.usageLimits.userInfo = data?.userInfo
-                    ? {
-                        email: data.userInfo.email || '',
-                        userId: data.userInfo.userId || '',
-                        status: data.userInfo.status || ''
-                    }
-                    : null;
-                result.usageLimits.usedCount = data?.usedCount ?? null;
-                result.usageLimits.limitCount = data?.limitCount ?? null;
-                result.usageLimits.nextDateReset = data?.nextDateReset ?? null;
+                result.usageLimits.userInfo = normalized.userInfo;
+                result.usageLimits.usedCount = normalized.usedCount;
+                result.usageLimits.limitCount = normalized.limitCount;
+                result.usageLimits.nextDateReset = normalized.nextDateReset;
+                result.usageLimits.resourceType = normalized.resourceType;
+                result.usageLimits.unit = normalized.unit;
             } catch (e) {
                 const statusCode = e?.response?.status ?? null;
                 const msg = e?.message ? String(e.message) : 'Usage limits request failed';
