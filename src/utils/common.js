@@ -25,6 +25,7 @@ export const RETRYABLE_NETWORK_ERRORS = [
     'EAI_AGAIN',       // DNS 临时失败
     'ECONNABORTED',    // 连接中止
     'ESOCKETTIMEDOUT', // Socket 超时
+    'aborted',         // Node.js http stream abort (response terminated before completion)
     // Common proxy/tunneling failures (treat as retryable network flakiness)
     'Proxy connection ended before receiving CONNECT response',
     'Proxy connection timed out',

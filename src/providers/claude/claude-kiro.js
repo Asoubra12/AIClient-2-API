@@ -31,7 +31,7 @@ const KIRO_CONSTANTS = {
     AMAZONQ_AMZ_TARGET: 'AmazonQDeveloperStreamingService.SendMessage',
     CODEWHISPERER_AMZ_TARGET: 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
     DEFAULT_MODEL_NAME: 'claude-sonnet-4-5',
-    AXIOS_TIMEOUT: 120000, // 2 minutes timeout for normal requests
+    AXIOS_TIMEOUT: 300000, // 5 minutes timeout for streaming with large contexts
     TOKEN_REFRESH_TIMEOUT: 15000, // 15 seconds timeout for token refresh (shorter to avoid blocking)
     USER_AGENT: 'KiroIDE',
     KIRO_VERSION: '0.8.140',
