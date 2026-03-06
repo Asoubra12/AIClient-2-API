@@ -1,0 +1,30 @@
+flowchart LR
+    start([Caller requests models or provider health])
+
+    subgraph api["🧭 read endpoints"]
+        direction LR
+        health["GET /provider_health"]
+        models["GET /v1/models or /v1beta/models"]
+    end
+
+    subgraph service["📚 read aggregation"]
+        direction LR
+        status["getProviderStatus"]
+        avail["Compute availabilityState"]
+        list["handleModelListRequest"]
+        pool["getAllAvailableModels or getApiService"]
+    end
+
+    finish([Read response returned])
+
+    start --> health
+    start --> models
+    health --> status
+    status --> avail
+    models --> list
+    list --> pool
+    avail --> finish
+    pool --> finish
+
+    style start fill:#e1f5e1
+    style finish fill:#ffe1e1

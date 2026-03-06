@@ -47,9 +47,18 @@
     },
     "PROXY_URL": "http://127.0.0.1:1089",
     "PROXY_ENABLED_PROVIDERS": [
-            "gemini-cli-oauth",
-            "gemini-antigravity"
+            "gemini-cli-oauth"
     ],
+    "IPOASIS_API_KEY": "your-ipoasis-api-key",
+    "IPOASIS_PROXY_PROTOCOL": "http",
+    "IPOASIS_PROXY_COUNTRY": "US",
+    "IPOASIS_PROXY_CITY": null,
+    "IPOASIS_PROXY_STATE": null,
+    "TLS_MIN_SWITCH_GAP_MS": 30000,
+    "TLS_MAX_NEW_SESSIONS_PER_MIN": 5,
+    "launchStrategy": "auto",
+    "heartbeatIntervalMs": 30000,
+    "heartbeatMaxMisses": 3,
     "LOG_ENABLED": true,
     "LOG_OUTPUT_MODE": "all",
     "LOG_LEVEL": "info",

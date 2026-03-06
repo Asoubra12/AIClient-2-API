@@ -190,6 +190,7 @@ class PluginManager {
      */
     async initAll(config) {
         await this.loadConfig();
+        await this._initializeProviderPipelines();
         
         for (const [name, plugin] of this.plugins) {
             const pluginConfig = this.pluginsConfig.plugins[name] || {};
@@ -213,6 +214,14 @@ class PluginManager {
         }
         
         this.initialized = true;
+    }
+
+    async _initializeProviderPipelines() {
+        try {
+            await this._getAntigravityPipeline();
+        } catch (error) {
+            logger.debug('[PluginManager] Failed to initialize provider pipelines:', error.message);
+        }
     }
 
     /**
@@ -454,6 +463,53 @@ class PluginManager {
                 logger.error(`[PluginManager] Hook "${hookName}" error in plugin "${plugin.name}":`, error.message);
             }
         }
+    }
+
+    /**
+     * Execute provider-specific pre-hooks before content generation.
+     * Currently only Antigravity has provider-specific hooks.
+     * @param {Object} context - Request context with provider, config, requestBody, model, etc.
+     * @returns {Promise<Object>} Modified context
+     */
+    async executeProviderPreHooks(context) {
+        try {
+            const pipeline = await this._getAntigravityPipeline();
+            if (pipeline) {
+                return await pipeline.runPreHooks(context);
+            }
+        } catch (err) {
+            logger.debug('[PluginManager] Provider pre-hooks error:', err.message);
+        }
+        return context;
+    }
+
+    /**
+     * Execute provider-specific post-hooks after content generation (fire-and-forget).
+     * @param {Object} context - Request context with response data
+     */
+    executeProviderPostHooks(context) {
+        try {
+            if (this._antigravityPipeline) {
+                this._antigravityPipeline.runPostHooks(context);
+            }
+        } catch (err) {
+            logger.debug('[PluginManager] Provider post-hooks error:', err.message);
+        }
+    }
+
+    /** @private */
+    async _getAntigravityPipeline() {
+        if (!this._antigravityPipeline) {
+            try {
+                const { default: pipeline } = await import('../middleware/antigravity/index.js');
+                await pipeline.initialize();
+                this._antigravityPipeline = pipeline;
+            } catch (err) {
+                logger.debug('[PluginManager] Failed to load Antigravity pipeline:', err.message);
+                return null;
+            }
+        }
+        return this._antigravityPipeline;
     }
 
     /**

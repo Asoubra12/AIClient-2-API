@@ -63,6 +63,11 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         SYSTEM_PROMPT_MODE: 'append',
         PROXY_URL: null, // HTTP/HTTPS/SOCKS5 代理地址，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
         PROXY_ENABLED_PROVIDERS: [], // 启用代理的提供商列表，如 ['gemini-cli-oauth', 'claude-kiro-oauth']
+        IPOASIS_API_KEY: null,
+        IPOASIS_PROXY_PROTOCOL: 'http',
+        IPOASIS_PROXY_COUNTRY: null,
+        IPOASIS_PROXY_CITY: null,
+        IPOASIS_PROXY_STATE: null,
         PROMPT_LOG_BASE_NAME: "prompt_log",
         PROMPT_LOG_MODE: "none",
         REQUEST_MAX_RETRIES: 3,
@@ -85,6 +90,9 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         LOG_INCLUDE_TIMESTAMP: true,
         LOG_MAX_FILE_SIZE: 10485760,
         LOG_MAX_FILES: 10,
+        launchStrategy: 'auto',
+        heartbeatIntervalMs: 30000,
+        heartbeatMaxMisses: 3,
         TLS_SIDECAR_ENABLED: false, // 启用 Go uTLS sidecar（需要编译 tls-sidecar 二进制）
         TLS_SIDECAR_PORT: 9090,     // sidecar 监听端口
         TLS_SIDECAR_BINARY_PATH: null // 自定义二进制路径（默认自动搜索）

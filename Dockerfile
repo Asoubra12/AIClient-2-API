@@ -19,8 +19,11 @@ FROM node:20-alpine
 LABEL maintainer="AIClient2API Team"
 LABEL description="Docker image for AIClient2API server"
 
-# 安装必要的系统工具（tar 用于更新功能，git 用于版本检查）
-RUN apk add --no-cache tar git
+# 安装必要的系统工具（tar 用于更新功能，git 用于版本检查，tini 用于 PID 1 管理）
+RUN apk add --no-cache tar git tini
+
+# 安装原生可选依赖的编译工具，确保 waitpid2 等模块在镜像构建时可用
+RUN apk add --no-cache --virtual .build-deps python3 make g++
 
 # 设置工作目录
 WORKDIR /app
@@ -32,6 +35,7 @@ COPY package*.json ./
 # 使用--production标志只安装生产依赖，减小镜像大小
 # 使用--omit=dev来排除开发依赖
 RUN npm install
+RUN apk del .build-deps
 
 # 复制源代码
 COPY . .
@@ -52,6 +56,9 @@ EXPOSE 3000 8085 8086 19876-19880
 # 添加健康检查
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD node healthcheck.js || exit 1
+
+# 使用 tini 作为 PID 1 处理僵尸进程和信号转发
+ENTRYPOINT ["tini", "--"]
 
 # 设置启动命令
 # 使用默认配置启动服务器，支持通过环境变量配置

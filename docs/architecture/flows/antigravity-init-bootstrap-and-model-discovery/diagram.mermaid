@@ -1,0 +1,45 @@
+flowchart LR
+    start([Antigravity account initialization begins])
+
+    subgraph auth["🔐 auth and init"]
+        direction LR
+        init["initialize"]
+        refresh["Refresh token or start auth flow"]
+        discover["discoverProjectAndModels"]
+    end
+
+    subgraph upstream["🌐 upstream bootstrap"]
+        direction LR
+        nux["cascadeNuxes"]
+        user["fetchUserInfo"]
+        meta["loadCodeAssist metadata"]
+        proj["loadCodeAssist project"]
+        models["fetchAvailableModels"]
+        admin["fetchAdminControls"]
+    end
+
+    subgraph store["🗃️ persistence"]
+        direction LR
+        quota[(Database: upsert quota_state)]
+        healthy["Reset refresh status and mark healthy"]
+    end
+
+    finish([Account can re-enter selection])
+
+    start --> init
+    init --> refresh
+    refresh --> discover
+    discover --> nux
+    nux --> user
+    user --> meta
+    meta --> proj
+    proj --> models
+    proj --> admin
+    models --> quota
+    quota --> healthy
+    admin --> healthy
+    healthy --> finish
+
+    style start fill:#e1f5e1
+    style quota fill:#e1f0ff
+    style finish fill:#ffe1e1

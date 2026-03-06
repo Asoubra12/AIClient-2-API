@@ -1,5 +1,6 @@
 import logger from '../utils/logger.js';
 import * as http from 'http';
+import * as path from 'path';
 import { initializeConfig, CONFIG } from '../core/config-manager.js';
 import { initApiService, autoLinkProviderConfigs } from './service-manager.js';
 import { initializeUIManagement } from './ui-manager.js';
@@ -7,6 +8,8 @@ import { initializeAPIManagement } from './api-manager.js';
 import { createRequestHandler } from '../handlers/request-handler.js';
 import { discoverPlugins, getPluginManager } from '../core/plugin-manager.js';
 import { getTLSSidecar } from '../utils/tls-sidecar.js';
+import { pathToFileURL } from 'url';
+import { createWorkerMessageHandler as createWorkerMessageHandlerCore } from './worker-ipc.js';
 
 /**
  * @license
@@ -123,6 +126,16 @@ const IS_WORKER_PROCESS = process.env.IS_WORKER_PROCESS === 'true';
 
 // 存储服务器实例，用于优雅关闭
 let serverInstance = null;
+let workerRequestCount = 0;
+
+function getRuntimeStats() {
+    return {
+        memory: process.memoryUsage(),
+        cpu: process.cpuUsage(),
+        requestCount: workerRequestCount,
+        uptime: process.uptime(),
+    };
+}
 
 /**
  * 发送消息给主进程
@@ -134,36 +147,25 @@ function sendToMaster(message) {
     }
 }
 
+export function createWorkerMessageHandler({ sendToMaster: send = sendToMaster, gracefulShutdown: shutdown = gracefulShutdown, getRuntimeStats: getStats = getRuntimeStats } = {}) {
+    return createWorkerMessageHandlerCore({
+        sendToMaster: send,
+        gracefulShutdown: shutdown,
+        getRuntimeStats: getStats,
+    });
+}
+
 /**
  * 设置子进程通信处理
  */
 function setupWorkerCommunication() {
     if (!IS_WORKER_PROCESS) return;
 
+    const handleWorkerMessage = createWorkerMessageHandler();
+
     // 监听来自主进程的消息
     process.on('message', (message) => {
-        if (!message || !message.type) return;
-
-        logger.info('[Worker] Received message from master:', message.type);
-
-        switch (message.type) {
-            case 'shutdown':
-                logger.info('[Worker] Shutdown requested by master');
-                gracefulShutdown();
-                break;
-            case 'status':
-                sendToMaster({
-                    type: 'status',
-                    data: {
-                        pid: process.pid,
-                        uptime: process.uptime(),
-                        memoryUsage: process.memoryUsage()
-                    }
-                });
-                break;
-            default:
-                logger.info('[Worker] Unknown message type:', message.type);
-        }
+        handleWorkerMessage(message);
     });
 
     // 监听断开连接
@@ -289,13 +291,17 @@ async function startServer() {
     
     // Create request handler
     const requestHandlerInstance = createRequestHandler(CONFIG, getProviderPoolManager());
+    const trackedRequestHandler = (req, res) => {
+        workerRequestCount += 1;
+        return requestHandlerInstance(req, res);
+    };
 
     serverInstance = http.createServer({
         // 设置服务器级别的超时
         requestTimeout: 0, // 禁用请求超时（流式响应需要）
         headersTimeout: 60000, // 头部超时 60 秒
         keepAliveTimeout: 65000 // Keep-alive 超时
-    }, requestHandlerInstance);
+    }, trackedRequestHandler);
 
     // 设置服务器的最大连接数
     serverInstance.maxConnections = 1000;
@@ -370,15 +376,24 @@ async function startServer() {
 }
 
 // 设置信号处理
-setupSignalHandlers();
+const isDirectExecution = (() => {
+    if (!process.argv[1]) {
+        return false;
+    }
 
-// 设置子进程通信
-setupWorkerCommunication();
+    const entryUrl = pathToFileURL(path.resolve(process.argv[1])).href;
+    return entryUrl === import.meta.url;
+})();
 
-startServer().catch(err => {
-    logger.error("[Server] Failed to start server:", err.message);
-    process.exit(1);
-});
+if (isDirectExecution) {
+    setupSignalHandlers();
+    setupWorkerCommunication();
+
+    startServer().catch(err => {
+        logger.error("[Server] Failed to start server:", err.message);
+        process.exit(1);
+    });
+}
 
 // 导出用于外部调用
-export { gracefulShutdown, sendToMaster };
+export { gracefulShutdown, sendToMaster, setupSignalHandlers, setupWorkerCommunication, startServer };

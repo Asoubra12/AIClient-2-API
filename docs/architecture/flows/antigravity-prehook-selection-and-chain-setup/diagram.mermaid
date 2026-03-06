@@ -1,0 +1,33 @@
+flowchart LR
+    start([Request enters pre-hook pipeline])
+
+    subgraph pipeline["🪝 Antigravity pipeline"]
+        direction LR
+        quota["QuotaSelectHook"]
+        qread[(Database: read quota_state)]
+        qreserve[(Database: decrement local_estimate)]
+        chain["ChainSetupHook"]
+        session["SessionIdHook"]
+    end
+
+    subgraph request["📨 request context"]
+        direction LR
+        attach["Attach preSelectedUuid and sessionId"]
+        reconcile["Reconcile quota reservation"]
+    end
+
+    finish([Service selection can proceed])
+
+    start --> quota
+    quota --> qread
+    qread --> qreserve
+    qreserve --> chain
+    chain --> session
+    session --> attach
+    attach --> reconcile
+    reconcile --> finish
+
+    style start fill:#e1f5e1
+    style qread fill:#e1f0ff
+    style qreserve fill:#e1f0ff
+    style finish fill:#ffe1e1

@@ -1,0 +1,39 @@
+flowchart LR
+    start([Master boot or restart request])
+
+    subgraph master["🛠️ master and supervisor"]
+        direction LR
+        spawn["startWorker or restartWorker"]
+        wait["awaitWorkerReady"]
+        ping["Send heartbeat_ping"]
+        restart["Schedule restart"]
+    end
+
+    subgraph worker["⚙️ worker process"]
+        direction LR
+        ready["Send ready"]
+        pong["Send heartbeat_pong"]
+    end
+
+    subgraph api["📡 admin surface"]
+        direction LR
+        health["GET /master/health"]
+        ui["POST /api/restart-service"]
+    end
+
+    finish([Worker ready or degraded state reported])
+
+    start --> spawn
+    spawn --> wait
+    wait -.-> ready
+    ready -.-> finish
+    wait --> ping
+    ping -.-> pong
+    pong -.-> finish
+    ui -.-> restart
+    ping --> restart
+    restart --> spawn
+    health --> finish
+
+    style start fill:#e1f5e1
+    style finish fill:#ffe1e1

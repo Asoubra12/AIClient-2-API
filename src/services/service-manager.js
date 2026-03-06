@@ -5,6 +5,7 @@ import deepmerge from 'deepmerge';
 import * as fs from 'fs';
 import { promises as pfs } from 'fs';
 import * as path from 'path';
+import { materializeAntigravityProxyLeases } from './antigravity-proxy-materializer.js';
 import {
     PROVIDER_MAPPINGS,
     createProviderConfig,
@@ -17,6 +18,50 @@ import { MODEL_PROVIDER } from '../utils/common.js';
 
 // 存储 ProviderPoolManager 实例
 let providerPoolManager = null;
+
+const ANTIGRAVITY_PREWARM_BATCH_SIZE = 5;
+const ANTIGRAVITY_PREWARM_BATCH_DELAY_MS = 1000;
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function hasAntigravityProxy(providerType, providerConfig) {
+    if (providerType !== MODEL_PROVIDER.ANTIGRAVITY) {
+        return true;
+    }
+
+    const proxyUrl = providerConfig?.PROXY_URL;
+    return typeof proxyUrl === 'string' && proxyUrl.trim().length > 0;
+}
+
+function getAvailabilityState(providerType, providerConfig) {
+    if (providerConfig?.isDisabled) {
+        return 'disabled';
+    }
+
+    if (providerConfig?.needsRefresh) {
+        return 'needs_refresh';
+    }
+
+    if (providerConfig?.isHealthy === false) {
+        const recoveryAt = Date.parse(providerConfig?.scheduledRecoveryTime);
+        if (Number.isFinite(recoveryAt) && recoveryAt > Date.now()) {
+            return 'scheduled_recovery';
+        }
+        return 'unhealthy';
+    }
+
+    if (!hasAntigravityProxy(providerType, providerConfig)) {
+        return 'missing_proxy';
+    }
+
+    return 'ready';
+}
+
+function isProviderSelectable(providerType, providerConfig) {
+    return getAvailabilityState(providerType, providerConfig) === 'ready';
+}
 
 /**
  * 扫描 configs 目录并自动关联未关联的配置文件到对应的提供商
@@ -268,6 +313,7 @@ async function scanProviderDirectory(dirPath, linkedPaths, newProviders, options
  * @returns {Promise<Object>} The initialized services
  */
 export async function initApiService(config, isReady = false) {
+    await materializeAntigravityProxyLeases(config);
 
     if (config.providerPools && Object.keys(config.providerPools).length > 0) {
         providerPoolManager = new ProviderPoolManager(config.providerPools, {
@@ -349,7 +395,70 @@ export async function initApiService(config, isReady = false) {
     } else {
         logger.info('[Initialization] No provider pools configured. Skipping node initialization.');
     }
+
+    if (isReady) {
+        try {
+            await prewarmAntigravityAccounts(config);
+        } catch (error) {
+            logger.warn(`[Initialization] Antigravity prewarm failed: ${error.message}`);
+        }
+    }
+
     return serviceInstances; // Return the collection of initialized service instances
+}
+
+export async function prewarmAntigravityAccounts(config) {
+    const antigravityPool = config.providerPools?.[MODEL_PROVIDER.ANTIGRAVITY];
+    if (!Array.isArray(antigravityPool) || antigravityPool.length === 0) {
+        return;
+    }
+
+    if (config.DEFAULT_MODEL_PROVIDERS && Array.isArray(config.DEFAULT_MODEL_PROVIDERS)) {
+        if (!config.DEFAULT_MODEL_PROVIDERS.includes(MODEL_PROVIDER.ANTIGRAVITY)) {
+            return;
+        }
+    }
+
+    const eligibleNodes = antigravityPool.filter(node => !node.isDisabled && node.isHealthy !== false);
+    if (eligibleNodes.length === 0) {
+        return;
+    }
+
+    logger.info(`[Initialization] Pre-warming ${eligibleNodes.length} Antigravity account(s) in batches of ${ANTIGRAVITY_PREWARM_BATCH_SIZE}...`);
+
+    for (let index = 0; index < eligibleNodes.length; index += ANTIGRAVITY_PREWARM_BATCH_SIZE) {
+        const batch = eligibleNodes.slice(index, index + ANTIGRAVITY_PREWARM_BATCH_SIZE);
+        const results = await Promise.allSettled(batch.map(async providerConfig => {
+            const nodeConfig = deepmerge(config, {
+                ...providerConfig,
+                MODEL_PROVIDER: MODEL_PROVIDER.ANTIGRAVITY,
+            });
+            delete nodeConfig.providerPools;
+
+            const adapter = getServiceAdapter(nodeConfig);
+            if (adapter?.antigravityApiService?.initialize) {
+                await adapter.antigravityApiService.initialize();
+                if (adapter.antigravityApiService.accountEmail) {
+                    providerConfig.ANTIGRAVITY_ACCOUNT_EMAIL = adapter.antigravityApiService.accountEmail;
+                }
+            }
+        }));
+
+        results.forEach((result, batchIndex) => {
+            if (result.status === 'rejected') {
+                const providerConfig = batch[batchIndex];
+                const identifier = providerConfig.customName || providerConfig.uuid || 'unknown';
+                const errorMessage = result.reason?.message || result.reason;
+                providerConfig.needsRefresh = true;
+                providerConfig.lastErrorMessage = `${errorMessage}`;
+                logger.warn(`[Initialization] Antigravity prewarm failed for ${identifier}: ${errorMessage}`);
+            }
+        });
+
+        if (index + ANTIGRAVITY_PREWARM_BATCH_SIZE < eligibleNodes.length) {
+            await delay(ANTIGRAVITY_PREWARM_BATCH_DELAY_MS);
+        }
+    }
 }
 
 /**
@@ -492,7 +601,15 @@ export async function getApiServiceWithFallback(config, requestedModel = null, o
         throw new Error(`[API Service] Auto-routing failed: Model name must include a provider prefix (e.g., 'provider:model'). Received: '${actualModelName}'`);
     }
     
-    const service = getServiceAdapter(serviceConfig);
+    let service;
+    try {
+        service = getServiceAdapter(serviceConfig);
+    } catch (error) {
+        if (providerPoolManager && options.acquireSlot === true && actualProviderType && selectedUuid) {
+            providerPoolManager.releaseSlot(actualProviderType, selectedUuid);
+        }
+        throw error;
+    }
     
     return {
         service,
@@ -548,7 +665,8 @@ export async function getProviderStatus(config, options = {}) {
     // providerPoolsSlim 只保留顶级 key 及部分字段，过滤 isDisabled 为 true 的元素
     const slimFields = [
         'customName',
-        'isHealthy',
+        'needsRefresh',
+        'scheduledRecoveryTime',
         'lastErrorTime',
         'lastErrorMessage'
     ];
@@ -587,6 +705,10 @@ export async function getProviderStatus(config, options = {}) {
                 for (const f of slimFields) {
                     slim[f] = item.hasOwnProperty(f) ? item[f] : null;
                 }
+                slim.rawIsHealthy = item.hasOwnProperty('isHealthy') ? item.isHealthy : null;
+                slim.availabilityState = getAvailabilityState(key, item);
+                slim.isSelectable = isProviderSelectable(key, item);
+                slim.isHealthy = slim.isSelectable;
                 // identify 字段
                 if (identifyField && item.hasOwnProperty(identifyField)) {
                     let tmpCustomName = item.customName ? `${item.customName}` : 'NoCustomName';
@@ -598,7 +720,7 @@ export async function getProviderStatus(config, options = {}) {
                 slim.provider = key;
                 // 统计
                 count++;
-                if (slim.isHealthy === false) {
+                if (slim.isSelectable === false) {
                     unhealthyCount++;
                     if (slim.identify) unhealthyProvideIdentifyList.push(slim.identify);
                 }

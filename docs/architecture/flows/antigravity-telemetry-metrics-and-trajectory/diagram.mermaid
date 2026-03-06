@@ -1,0 +1,32 @@
+flowchart LR
+    start([Provider post-hooks start])
+
+    subgraph context["🧾 request context"]
+        direction LR
+        mode["Resolve telemetryMode"]
+        fp["Load or create fingerprint"]
+    end
+
+    subgraph hooks["📊 telemetry hooks"]
+        direction LR
+        metrics["MetricsHook build and send"]
+        traj["TrajectoryHook build and send"]
+        log[(Database: ensure or update telemetry_log)]
+        acct[(Database: account_fingerprints)]
+    end
+
+    finish([Telemetry state persisted])
+
+    start --> mode
+    mode --> fp
+    fp --> acct
+    fp --> metrics
+    fp --> traj
+    metrics --> log
+    traj --> log
+    log --> finish
+
+    style start fill:#e1f5e1
+    style log fill:#e1f0ff
+    style acct fill:#e1f0ff
+    style finish fill:#ffe1e1

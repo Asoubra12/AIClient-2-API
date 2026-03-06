@@ -1,0 +1,38 @@
+flowchart LR
+    start([Generation attempt fails])
+
+    subgraph request["📨 request control"]
+        direction LR
+        capture["Capture error metadata"]
+        unhealthy["Mark node unhealthy when required"]
+        reacquire["getApiServiceWithFallback"]
+    end
+
+    subgraph pool["🧱 provider pool"]
+        direction LR
+        select["Select replacement provider"]
+        reserve["Acquire replacement slot"]
+        reconcile["Reconcile quota reservation"]
+        release[(Database: release active slot)]
+    end
+
+    subgraph outcome["✅ retry outcome"]
+        direction LR
+        retry["Retry stream or unary handler"]
+        fail["Return terminal error"]
+    end
+
+    start --> capture
+    capture --> unhealthy
+    unhealthy --> reacquire
+    reacquire --> select
+    select --> reserve
+    reserve --> reconcile
+    reconcile --> retry
+    retry --> release
+    capture --> fail
+    fail --> release
+
+    style start fill:#e1f5e1
+    style release fill:#e1f0ff
+    style fail fill:#ffe1e1

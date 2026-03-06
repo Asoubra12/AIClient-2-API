@@ -1,0 +1,31 @@
+flowchart LR
+    start([Pool initialization or lifecycle trigger])
+
+    subgraph pool["🧱 provider pool lifecycle"]
+        direction LR
+        validate["Validate per-node PROXY_URL"]
+        select["Select provider or reserve slot"]
+        unhealthy["Mark unhealthy or quarantine"]
+        recover["Reset refresh status and restore healthy"]
+    end
+
+    subgraph tls["🔒 TLS isolation"]
+        direction LR
+        wait["Apply switch-gap or session-budget wait"]
+        cleanup["Destroy cached Antigravity agent"]
+    end
+
+    finish([Node state updated])
+
+    start --> validate
+    validate --> select
+    select --> wait
+    wait --> finish
+    select --> unhealthy
+    unhealthy --> cleanup
+    cleanup --> finish
+    unhealthy --> recover
+    recover --> finish
+
+    style start fill:#e1f5e1
+    style finish fill:#ffe1e1

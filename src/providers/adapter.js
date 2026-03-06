@@ -231,6 +231,10 @@ export class AntigravityApiServiceAdapter extends ApiServiceAdapter {
         }
         return this.antigravityApiService.getUsageLimits();
     }
+
+    destroy() {
+        this.antigravityApiService?.destroy?.();
+    }
 }
 
 // OpenAI API 服务适配器
@@ -703,6 +707,39 @@ registerAdapter(MODEL_PROVIDER.GROK_CUSTOM, GrokApiServiceAdapter);
 
 // 用于存储服务适配器单例的映射
 export const serviceInstances = {};
+
+function matchesAccountUuid(adapterInstance, accountUuid, cacheKey) {
+    if (!accountUuid) {
+        return false;
+    }
+
+    return cacheKey.endsWith(accountUuid) ||
+        adapterInstance?.antigravityApiService?.uuid === accountUuid;
+}
+
+export function destroyAgent(accountUuid) {
+    if (!accountUuid) {
+        return;
+    }
+
+    for (const [cacheKey, adapterInstance] of Object.entries(serviceInstances)) {
+        if (!matchesAccountUuid(adapterInstance, accountUuid, cacheKey)) {
+            continue;
+        }
+
+        try {
+            if (typeof adapterInstance?.destroy === 'function') {
+                adapterInstance.destroy();
+            } else if (adapterInstance?.antigravityApiService?.destroy) {
+                adapterInstance.antigravityApiService.destroy();
+            }
+        } catch (error) {
+            logger.warn(`[Adapter] Failed to destroy agent for ${accountUuid}: ${error.message}`);
+        }
+
+        delete serviceInstances[cacheKey];
+    }
+}
 
 // 服务适配器工厂
 export function getServiceAdapter(config) {

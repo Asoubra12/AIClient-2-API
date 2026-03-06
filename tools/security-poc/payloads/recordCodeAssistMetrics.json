@@ -1,0 +1,25 @@
+{
+  "project": "snappy-decker-84xv4",
+  "requestId": "79b08672-3ada-4dcf-96d0-810721e00a4c",
+  "metadata": {
+    "ideType": "ANTIGRAVITY",
+    "ideVersion": "1.19.6",
+    "platform": "WINDOWS_AMD64"
+  },
+  "metrics": [
+    {
+      "timestamp": "2026-03-05T23:47:41.272557Z",
+      "conversationOffered": {
+        "status": "ACTION_STATUS_NO_ERROR",
+        "traceId": "177f77bdaf82ab35",
+        "streamingLatency": {
+          "firstMessageLatency": "2.733911300s",
+          "totalLatency": "3.844579200s"
+        },
+        "isAgentic": true,
+        "initiationMethod": "AGENT",
+        "trajectoryId": "179c837c-8253-4105-902c-d37299fc89d0"
+      }
+    }
+  ]
+}

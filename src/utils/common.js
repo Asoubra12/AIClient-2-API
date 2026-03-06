@@ -6,6 +6,7 @@ import logger from './logger.js';
 import { convertData, getOpenAIStreamChunkStop } from '../convert/convert.js';
 import { ProviderStrategyFactory } from './provider-strategies.js';
 import { getPluginManager } from '../core/plugin-manager.js';
+import { reconcileQuotaReservation } from '../middleware/antigravity/quota-select.js';
 
 // ==================== 网络错误处理 ====================
 
@@ -292,6 +293,169 @@ export async function handleUnifiedResponse(res, responsePayload, isStream) {
     }
 }
 
+function cloneRequestPayload(payload) {
+    if (payload == null) {
+        return payload;
+    }
+
+    return JSON.parse(JSON.stringify(payload));
+}
+
+function toNumericTokenValue(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+    }
+
+    if (typeof value === 'string' && value.trim() !== '') {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    return null;
+}
+
+function getNestedValue(target, path) {
+    let current = target;
+    for (const key of path) {
+        current = current?.[key];
+        if (current == null) {
+            return null;
+        }
+    }
+    return current;
+}
+
+function extractResponseMetadata(payload) {
+    if (!payload || typeof payload !== 'object') {
+        return {};
+    }
+
+    const responseTokenCount = [
+        ['usageMetadata', 'candidatesTokenCount'],
+        ['usage', 'output_tokens'],
+        ['usage', 'outputTokens'],
+        ['usage', 'completion_tokens'],
+        ['usage', 'responseOutputTokens'],
+    ].map(path => toNumericTokenValue(getNestedValue(payload, path))).find(value => value != null) ?? null;
+
+    const thinkingTokenCount = [
+        ['usageMetadata', 'thoughtsTokenCount'],
+        ['usage', 'reasoning_tokens'],
+        ['usage', 'thinkingTokens'],
+        ['usage', 'thinking_tokens'],
+    ].map(path => toNumericTokenValue(getNestedValue(payload, path))).find(value => value != null) ?? null;
+
+    return {
+        finishReason: payload?.candidates?.[0]?.finishReason
+            ?? payload?.choices?.[0]?.finish_reason
+            ?? payload?.stop_reason
+            ?? payload?.finishReason
+            ?? null,
+        responseTokenCount,
+        thinkingTokenCount,
+        requestId: payload?.requestId
+            ?? payload?.id
+            ?? payload?.responseId
+            ?? payload?.usage?.responseId
+            ?? null,
+        traceId: payload?.traceId
+            ?? payload?.metadata?.traceId
+            ?? null,
+    };
+}
+
+function mergeResponseMetadata(current, next) {
+    if (!next) {
+        return current;
+    }
+
+    return {
+        finishReason: next.finishReason ?? current.finishReason ?? null,
+        responseTokenCount: next.responseTokenCount ?? current.responseTokenCount ?? null,
+        thinkingTokenCount: next.thinkingTokenCount ?? current.thinkingTokenCount ?? null,
+        requestId: next.requestId ?? current.requestId ?? null,
+        traceId: next.traceId ?? current.traceId ?? null,
+        latencyMs: next.latencyMs ?? current.latencyMs ?? null,
+        firstTokenLatencyMs: next.firstTokenLatencyMs ?? current.firstTokenLatencyMs ?? null,
+        streamingDuration: next.streamingDuration ?? current.streamingDuration ?? null,
+        responseText: next.responseText ?? current.responseText ?? null,
+        error: next.error ?? current.error ?? null,
+    };
+}
+
+function createTelemetryError(error) {
+    if (!error) {
+        return null;
+    }
+
+    return {
+        message: error.message || 'Unknown error',
+        code: error.code ?? null,
+        status: error.status ?? error.response?.status ?? null,
+        response: error.response ? {
+            status: error.response.status ?? null,
+            data: error.response.data ?? null,
+        } : undefined,
+    };
+}
+
+async function buildProviderRequestBody(originalRequestBody, fromProvider, toProvider, config, requestPath = null, options = {}) {
+    let processedRequestBody = cloneRequestPayload(originalRequestBody);
+
+    if (config._monitorRequestId) {
+        processedRequestBody._monitorRequestId = config._monitorRequestId;
+    }
+
+    if (config.requestBaseUrl) {
+        processedRequestBody._requestBaseUrl = config.requestBaseUrl;
+    }
+
+    if (getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider)) {
+        logger.info(`[Request Convert] Converting request from ${fromProvider} to ${toProvider}`);
+        processedRequestBody = convertData(processedRequestBody, 'request', fromProvider, toProvider);
+    } else {
+        logger.info(`[Request Convert] Request format matches backend provider. No conversion needed.`);
+    }
+
+    if (options.applySystemPrompt !== false) {
+        processedRequestBody = await _applySystemPromptFromFile(config, processedRequestBody, toProvider);
+        await _manageSystemPrompt(processedRequestBody, toProvider);
+    }
+
+    return processedRequestBody;
+}
+
+async function prepareProviderRequestBody(originalRequestBody, fromProvider, toProvider, config, requestPath = null, sessionId = null) {
+    const processedRequestBody = await buildProviderRequestBody(
+        originalRequestBody,
+        fromProvider,
+        toProvider,
+        config,
+        requestPath
+    );
+
+    if (sessionId && processedRequestBody) {
+        processedRequestBody._middlewareSessionId = sessionId;
+    }
+
+    if (requestPath && toProvider === MODEL_PROVIDER.FORWARD_API) {
+        logger.info(`[Forward API] Request path: ${requestPath}`);
+        processedRequestBody.endpoint = requestPath;
+    }
+
+    return processedRequestBody;
+}
+
+function resolveSelectionAccountKey(selectionResult, service, fallbackUuid = null) {
+    return selectionResult?.serviceConfig?.ANTIGRAVITY_ACCOUNT_EMAIL
+        || selectionResult?.service?.antigravityApiService?.accountEmail
+        || service?.antigravityApiService?.accountEmail
+        || selectionResult?.serviceConfig?.accountEmail
+        || selectionResult?.serviceConfig?.accountId
+        || fallbackUuid
+        || null;
+}
+
 export async function handleStreamRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName, retryContext = null) {
     let fullResponseText = '';
     let fullResponseJson = '';
@@ -304,6 +468,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     const maxRetries = retryContext?.maxRetries ?? 5;
     const currentRetry = retryContext?.currentRetry ?? 0;
     const CONFIG = retryContext?.CONFIG;
+    let responseMetadata = {};
+    const streamStartTime = Date.now();
+    let firstResponseAt = null;
     const isRetry = currentRetry > 0;
     
     // 使用共享的 clientDisconnected 状态（如果是重试，继承上层的状态）
@@ -352,6 +519,11 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 break;
             }
             
+            if (firstResponseAt === null) {
+                firstResponseAt = Date.now();
+            }
+            responseMetadata = mergeResponseMetadata(responseMetadata, extractResponseMetadata(nativeChunk));
+
             // Extract text for logging purposes
             const chunkText = extractResponseText(nativeChunk, toProvider);
             if (chunkText && !Array.isArray(chunkText)) {
@@ -477,12 +649,20 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
     }  catch (error) {
         logger.error('\n[Server] Error during stream processing:', error.stack);
+        responseMetadata = mergeResponseMetadata(responseMetadata, {
+            error: createTelemetryError(error),
+        });
         
         // 如果客户端已断开，不需要发送错误响应
         if (clientDisconnected.value) {
             logger.info('[Stream] Skipping error response due to client disconnect');
             responseClosed = true;
-            return;
+            return mergeResponseMetadata(responseMetadata, {
+                firstTokenLatencyMs: firstResponseAt != null ? firstResponseAt - streamStartTime : null,
+                streamingDuration: Date.now() - streamStartTime,
+                responseText: fullResponseText || null,
+                error: createTelemetryError(error),
+            });
         }
         
         // 如果已经发送了数据（包括 metadata），不进行重试（避免响应数据损坏或顺序错误）
@@ -499,7 +679,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 }
             }
             responseClosed = true;
-            return;
+            return mergeResponseMetadata(responseMetadata, {
+                firstTokenLatencyMs: firstResponseAt != null ? firstResponseAt - streamStartTime : null,
+                streamingDuration: Date.now() - streamStartTime,
+                responseText: fullResponseText || null,
+                error: createTelemetryError(error),
+            });
         }
         
         // 获取状态码（用于日志记录，不再用于判断是否重试）
@@ -549,6 +734,19 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 
                 if (result && result.service) {
                     logger.info(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
+                    const quotaReservation = reconcileQuotaReservation(retryContext?.quotaReservation, {
+                        provider: result.actualProviderType || toProvider,
+                        uuid: result.uuid || null,
+                        accountKey: resolveSelectionAccountKey(result, result.service, result.uuid || null),
+                    });
+                    const retryRequestBody = await prepareProviderRequestBody(
+                        retryContext?.originalRequestBody || requestBody,
+                        fromProvider,
+                        result.actualProviderType || toProvider,
+                        CONFIG,
+                        retryContext?.requestPath || null,
+                        retryContext?.sessionId || null
+                    );
                     
                     // 使用新服务重试
                     const newRetryContext = {
@@ -557,7 +755,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         currentRetry: currentRetry + 1,
                         maxRetries,
                         clientDisconnected,  // 传递断开状态
-                        anyDataSent          // 传递数据发送状态
+                        anyDataSent,         // 传递数据发送状态
+                        quotaReservation,
                     };
                     
                     // 递归调用，使用新的服务
@@ -565,7 +764,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         res,
                         result.service,
                         result.actualModel || model,
-                        requestBody,
+                        retryRequestBody,
                         fromProvider,
                         result.actualProviderType || toProvider,
                         PROMPT_LOG_MODE,
@@ -647,6 +846,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // fs.writeFile('oldResponseChunk'+Date.now()+'.json', fullOldResponseJson);
         // fs.writeFile('responseChunk'+Date.now()+'.json', fullResponseJson);
     }
+
+    return mergeResponseMetadata(responseMetadata, {
+        firstTokenLatencyMs: firstResponseAt != null ? firstResponseAt - streamStartTime : null,
+        streamingDuration: Date.now() - streamStartTime,
+        responseText: fullResponseText || null,
+    });
 }
 
 
@@ -656,6 +861,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
     const maxRetries = retryContext?.maxRetries ?? 5;
     const currentRetry = retryContext?.currentRetry ?? 0;
     const CONFIG = retryContext?.CONFIG;
+    let responseMetadata = {};
     
     try{
         // The service returns the response in its native format (toProvider).
@@ -663,7 +869,11 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         requestBody.model = model;
         // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
         const nativeResponse = await service.generateContent(model, requestBody);
+        responseMetadata = extractResponseMetadata(nativeResponse);
         const responseText = extractResponseText(nativeResponse, toProvider);
+        responseMetadata = mergeResponseMetadata(responseMetadata, {
+            responseText: typeof responseText === 'string' ? responseText : null,
+        });
 
         // Convert the response back to the client's format (fromProvider), if necessary.
         let clientResponse = nativeResponse;
@@ -702,6 +912,9 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         }
     } catch (error) {
         logger.error('\n[Server] Error during unary processing:', error.stack);
+        responseMetadata = mergeResponseMetadata(responseMetadata, {
+            error: createTelemetryError(error),
+        });
         
         // 获取状态码（用于日志记录，不再用于判断是否重试）
         const status = error.response?.status;
@@ -750,13 +963,27 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                 
                 if (result && result.service) {
                     logger.info(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
+                    const quotaReservation = reconcileQuotaReservation(retryContext?.quotaReservation, {
+                        provider: result.actualProviderType || toProvider,
+                        uuid: result.uuid || null,
+                        accountKey: resolveSelectionAccountKey(result, result.service, result.uuid || null),
+                    });
+                    const retryRequestBody = await prepareProviderRequestBody(
+                        retryContext?.originalRequestBody || requestBody,
+                        fromProvider,
+                        result.actualProviderType || toProvider,
+                        CONFIG,
+                        retryContext?.requestPath || null,
+                        retryContext?.sessionId || null
+                    );
                     
                     // 使用新服务重试
                     const newRetryContext = {
                         ...retryContext,
                         CONFIG,
                         currentRetry: currentRetry + 1,
-                        maxRetries
+                        maxRetries,
+                        quotaReservation,
                     };
                     
                     // 递归调用，使用新的服务
@@ -764,7 +991,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                         res,
                         result.service,
                         result.actualModel || model,
-                        requestBody,
+                        retryRequestBody,
                         fromProvider,
                         result.actualProviderType || toProvider,
                         PROMPT_LOG_MODE,
@@ -791,6 +1018,8 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
             providerPoolManager.releaseSlot(toProvider, pooluuid);
         }
     }
+
+    return responseMetadata;
 }
 
 /**
@@ -910,15 +1139,55 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     logger.info(`[Content Generation] Model: ${model}, Stream: ${isStream}`);
 
     let actualCustomName = CONFIG.customName;
+    const fallbackRequestId = CONFIG?._requestId || `proxy/${Date.now()}/${crypto.randomUUID()}`;
+    const providerHookOptions = {};
+    let providerHookContext = { options: providerHookOptions };
+    const initialProviderType = toProvider;
+    let selectionResult = null;
+
+    try {
+        const pluginManager = getPluginManager();
+        const preHookRequestBody = await buildProviderRequestBody(
+            originalRequestBody,
+            fromProvider,
+            initialProviderType,
+            CONFIG,
+            requestPath,
+            { applySystemPrompt: false }
+        );
+
+        providerHookContext = await pluginManager.executeProviderPreHooks({
+            config: CONFIG,
+            requestBody: preHookRequestBody,
+            model,
+            provider: initialProviderType,
+            accountEmail: CONFIG.accountId || CONFIG.customName || null,
+            uuid: pooluuid || null,
+            options: providerHookOptions,
+        }) || providerHookContext;
+    } catch (e) { /* pre-hooks are non-critical */ }
 
     // 2.5. 根据模型选择服务适配器：
     // - service 缺失时（例如上游未预先注入）进行兜底选择
     // - 使用号池/AUTO 时按模型重选并支持 fallback
     // 注意：仅在号池场景开启 acquireSlot，占用并发名额或进入队列
-    const shouldSelectByPool = providerPoolManager && (CONFIG.MODEL_PROVIDER === MODEL_PROVIDER.AUTO || (CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER]));
+    const shouldSelectByPool = Boolean(
+        providerPoolManager && (
+            CONFIG.MODEL_PROVIDER === MODEL_PROVIDER.AUTO
+            || (CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER])
+        )
+    );
+    const selectionOptions = {
+        acquireSlot: shouldSelectByPool,
+        ...(providerHookContext.options || {}),
+    };
+    if (providerHookContext.preSelectedUuid && !selectionOptions.preSelectedUuid) {
+        selectionOptions.preSelectedUuid = providerHookContext.preSelectedUuid;
+    }
     if (!service || shouldSelectByPool) {
         const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-        const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: shouldSelectByPool });
+        const result = await getApiServiceWithFallback(CONFIG, model, selectionOptions);
+        selectionResult = result;
 
         service = result.service;
         toProvider = result.actualProviderType;
@@ -938,40 +1207,33 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         }
     }
 
+    const quotaReservation = reconcileQuotaReservation(providerHookContext.quotaReservation, {
+        provider: toProvider,
+        uuid: selectionResult?.uuid || actualUuid || null,
+        accountKey: resolveSelectionAccountKey(selectionResult, service, actualUuid || null),
+    });
+
     // 1. Convert request body from client format to backend format, if necessary.
-    let processedRequestBody = originalRequestBody;
+    let processedRequestBody = await prepareProviderRequestBody(
+        originalRequestBody,
+        fromProvider,
+        toProvider,
+        CONFIG,
+        requestPath,
+        providerHookContext.sessionId
+    );
     // 将 _monitorRequestId 注入到 requestBody 中，以便在 service 内部访问
-    if (CONFIG._monitorRequestId) {
-        processedRequestBody._monitorRequestId = CONFIG._monitorRequestId;
-    }
     
     // 将 requestBaseUrl 注入到 requestBody 中，以便在转换器中使用
-    if (CONFIG.requestBaseUrl) {
-        processedRequestBody._requestBaseUrl = CONFIG.requestBaseUrl;
-    }
-
     // fs.writeFile('originalRequestBody'+Date.now()+'.json', JSON.stringify(originalRequestBody));
-    if (getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider)) {
-        logger.info(`[Request Convert] Converting request from ${fromProvider} to ${toProvider}`);
-        processedRequestBody = convertData(originalRequestBody, 'request', fromProvider, toProvider);
-    } else {
-        logger.info(`[Request Convert] Request format matches backend provider. No conversion needed.`);
-    }
-    
-    // 为 forward provider 添加原始请求路径作为 endpoint
-    if (requestPath && toProvider === MODEL_PROVIDER.FORWARD_API) {
-        logger.info(`[Forward API] Request path: ${requestPath}`);
-        processedRequestBody.endpoint = requestPath;
-    }
 
     // 3. Apply system prompt from file if configured.
-    processedRequestBody = await _applySystemPromptFromFile(CONFIG, processedRequestBody, toProvider);
-    await _manageSystemPrompt(processedRequestBody, toProvider);
-
     // 4. Log the incoming prompt (after potential conversion to the backend's format).
     const promptText = extractPromptText(processedRequestBody, toProvider);
     await logConversation('input', promptText, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
     
+    const generationStartTime = Date.now();
+
     // 5. Call the appropriate stream or unary handler, passing the provider info.
     // 创建重试上下文，包含 CONFIG 以便在认证错误时切换凭证重试
     // 凭证切换重试次数（默认 5），可在配置中自定义更大的值
@@ -980,13 +1242,27 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     // - 凭证切换重试：凭证被标记不健康后切换到其他凭证
     // 当没有不同的健康凭证可用时，重试会自动停止
     const credentialSwitchMaxRetries = CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
-    const retryContext = providerPoolManager ? { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries } : null;
-    
-    if (isStream) {
-        await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);
-    } else {
-        await handleUnaryRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);
-    }
+    const retryContext = providerPoolManager ? {
+        CONFIG,
+        currentRetry: 0,
+        maxRetries: credentialSwitchMaxRetries,
+        originalRequestBody,
+        requestPath,
+        sessionId: providerHookContext.sessionId || null,
+        quotaReservation,
+    } : null;
+
+    const responseMetadata = isStream
+        ? (await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext)) || {}
+        : (await handleUnaryRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext)) || {};
+
+    const generationEndTime = Date.now();
+    const hookMetadata = mergeResponseMetadata(responseMetadata, {
+        latencyMs: generationEndTime - generationStartTime,
+        streamingDuration: responseMetadata.streamingDuration ?? null,
+        firstTokenLatencyMs: responseMetadata.firstTokenLatencyMs ?? null,
+        requestId: responseMetadata.requestId ?? fallbackRequestId,
+    });
 
     // 执行插件钩子：内容生成后
     try {
@@ -998,7 +1274,26 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
             fromProvider,
             toProvider,
             model,
-            isStream
+            isStream,
+            ...hookMetadata,
+        });
+        // Execute Antigravity provider post-hooks (metrics, trajectory — fire-and-forget)
+        pluginManager.executeProviderPostHooks({
+            config: CONFIG,
+            service,
+            serviceConfig: service?.antigravityApiService?.config || null,
+            requestBody: processedRequestBody,
+            originalRequestBody,
+            model,
+            provider: toProvider,
+            accountEmail: service?.antigravityApiService?.accountEmail || CONFIG.ANTIGRAVITY_ACCOUNT_EMAIL || CONFIG.accountId || CONFIG.customName || actualUuid,
+            uuid: actualUuid,
+            timing: {
+                startTime: generationStartTime,
+                endTime: generationEndTime,
+                durationMs: generationEndTime - generationStartTime,
+            },
+            ...hookMetadata,
         });
     } catch (e) { /* 静默失败，不影响主流程 */ }
 }

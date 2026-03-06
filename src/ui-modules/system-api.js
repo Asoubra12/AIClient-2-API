@@ -164,10 +164,11 @@ export async function handleRestartService(req, res) {
                 message: 'Service restart requested, worker will be restarted by master process'
             });
             
-            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.writeHead(202, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
                 success: true,
-                message: 'Restart request sent to master process',
+                ready: false,
+                message: 'Restart request accepted. Confirm worker readiness via /master/health.',
                 mode: 'worker',
                 details: {
                     workerPid: process.pid,

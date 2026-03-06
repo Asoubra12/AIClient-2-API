@@ -17,6 +17,7 @@ import { getProxyConfigForProvider, getGoogleAuthProxyConfig } from '../../utils
 import { cleanJsonSchemaProperties } from '../../converters/utils.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
 import { MODEL_PROVIDER } from '../../utils/common.js';
+import { upsertQuota } from '../../db/quota-store.js';
 
 // 配置 HTTP/HTTPS agent 限制连接池大小，避免资源泄漏
 const httpAgent = new http.Agent({
@@ -604,23 +605,35 @@ function convertStreamToNonStream(stream) {
  * @param {Object} antigravityResponse - Antigravity 响应
  * @returns {Object|null} Gemini 格式响应
  */
-function toGeminiApiResponse(antigravityResponse) {
+export function toGeminiApiResponse(antigravityResponse) {
     if (!antigravityResponse) return null;
 
+    const responsePayload = antigravityResponse.response && !antigravityResponse.candidates
+        ? antigravityResponse.response
+        : antigravityResponse;
+
     const compliantResponse = {
-        candidates: antigravityResponse.candidates
+        candidates: responsePayload.candidates
     };
 
-    if (antigravityResponse.usageMetadata) {
-        compliantResponse.usageMetadata = antigravityResponse.usageMetadata;
+    if (responsePayload.usageMetadata) {
+        compliantResponse.usageMetadata = responsePayload.usageMetadata;
     }
 
-    if (antigravityResponse.promptFeedback) {
-        compliantResponse.promptFeedback = antigravityResponse.promptFeedback;
+    if (responsePayload.promptFeedback) {
+        compliantResponse.promptFeedback = responsePayload.promptFeedback;
     }
 
-    if (antigravityResponse.automaticFunctionCallingHistory) {
-        compliantResponse.automaticFunctionCallingHistory = antigravityResponse.automaticFunctionCallingHistory;
+    if (responsePayload.automaticFunctionCallingHistory) {
+        compliantResponse.automaticFunctionCallingHistory = responsePayload.automaticFunctionCallingHistory;
+    }
+
+    if (antigravityResponse.requestId || responsePayload.requestId) {
+        compliantResponse.requestId = antigravityResponse.requestId || responsePayload.requestId;
+    }
+
+    if (antigravityResponse.traceId || responsePayload.traceId) {
+        compliantResponse.traceId = antigravityResponse.traceId || responsePayload.traceId;
     }
 
     return compliantResponse;
@@ -738,12 +751,37 @@ export class AntigravityApiService {
         this.userAgent = DEFAULT_USER_AGENT; // 支持通用 USER_AGENT 配置
         this.projectId = config.PROJECT_ID;
         this.uuid = config.uuid; // 保存 uuid 用于缓存管理
+        this.userInfo = null;
+        this.accountEmail = config.ANTIGRAVITY_ACCOUNT_EMAIL || config.uuid || null;
+        this._initializePromise = null;
+        this.oauthProxyConfig = proxyConfig;
 
         // 多环境降级顺序
         this.baseURLs = this.getBaseURLFallbackOrder(config);
 
         // 保存代理配置供后续使用
         this.proxyConfig = getProxyConfigForProvider(config, 'gemini-antigravity');
+    }
+
+    destroy() {
+        const agents = new Set();
+        const collectAgent = (agent) => {
+            if (agent && typeof agent.destroy === 'function') {
+                agents.add(agent);
+            }
+        };
+
+        collectAgent(this.oauthProxyConfig?.agent);
+        collectAgent(this.proxyConfig?.httpAgent);
+        collectAgent(this.proxyConfig?.httpsAgent);
+
+        for (const agent of agents) {
+            try {
+                agent.destroy();
+            } catch (error) {
+                logger.debug(`[Antigravity] Failed to destroy proxy agent for ${this.uuid}: ${error.message}`);
+            }
+        }
     }
 
     /**
@@ -765,23 +803,82 @@ export class AntigravityApiService {
         ];
     }
 
-    async initialize() {
-        if (this.isInitialized) return;
-        logger.info('[Antigravity] Initializing Antigravity API Service...');
-        // 注意：V2 读写分离架构下，初始化不再执行同步认证/刷新逻辑
-        // 仅执行基础的凭证加载
-        await this.loadCredentials();
-
-        if (!this.projectId) {
-            this.projectId = await this.discoverProjectAndModels();
-        } else {
-            logger.info(`[Antigravity] Using provided Project ID: ${this.projectId}`);
-            // 获取可用模型
-            await this.fetchAvailableModels();
+    resolveProjectId(projectValue) {
+        if (typeof projectValue === 'string') {
+            return projectValue;
         }
 
-        this.isInitialized = true;
-        logger.info(`[Antigravity] Initialization complete. Project ID: ${this.projectId}`);
+        if (projectValue && typeof projectValue.id === 'string') {
+            return projectValue.id;
+        }
+
+        return '';
+    }
+
+    resolveAccountEmail(userInfo) {
+        return userInfo?.email ||
+            userInfo?.user?.email ||
+            userInfo?.userInfo?.email ||
+            this.config.ANTIGRAVITY_ACCOUNT_EMAIL ||
+            this.accountEmail ||
+            this.uuid ||
+            null;
+    }
+
+    persistQuotaState(modelsData, accountEmail = this.accountEmail) {
+        if (!accountEmail || !modelsData || typeof modelsData !== 'object') {
+            return;
+        }
+
+        for (const [modelId, modelData] of Object.entries(modelsData)) {
+            const aliasName = modelName2Alias(modelId);
+            if (!aliasName || !modelData?.quotaInfo) {
+                continue;
+            }
+
+            const remainingFraction = modelData.quotaInfo.remainingFraction !== undefined
+                ? modelData.quotaInfo.remainingFraction
+                : (modelData.quotaInfo.remaining || 0);
+            upsertQuota(
+                accountEmail,
+                aliasName,
+                remainingFraction,
+                modelData.quotaInfo.resetTime || null
+            );
+        }
+    }
+
+    async triggerQuotaRefresh(reason) {
+        try {
+            const { quotaScheduler } = await import('../../middleware/antigravity/quota-scheduler.js');
+            await quotaScheduler.triggerImmediateRefresh(this.config, MODEL_PROVIDER.ANTIGRAVITY);
+        } catch (error) {
+            logger.debug(`[Antigravity] Failed to trigger quota refresh after ${reason}: ${error.message}`);
+        }
+    }
+
+    async initialize() {
+        if (this.isInitialized) return;
+        if (this._initializePromise) {
+            return this._initializePromise;
+        }
+
+        this._initializePromise = (async () => {
+            logger.info('[Antigravity] Initializing Antigravity API Service...');
+            // 注意：V2 读写分离架构下，初始化不再执行同步认证/刷新逻辑
+            // 仅执行基础的凭证加载
+            await this.loadCredentials();
+            this.projectId = await this.discoverProjectAndModels(this.projectId);
+
+            this.isInitialized = true;
+            logger.info(`[Antigravity] Initialization complete. Project ID: ${this.projectId}`);
+        })();
+
+        try {
+            await this._initializePromise;
+        } finally {
+            this._initializePromise = null;
+        }
     }
 
     /**
@@ -831,7 +928,7 @@ export class AntigravityApiService {
                     // 刷新成功，重置 PoolManager 中的刷新状态并标记为健康
                     const poolManager = getProviderPoolManager();
                     if (poolManager && this.uuid) {
-                        poolManager.resetProviderRefreshStatus(MODEL_PROVIDER.ANTIGRAVITY, this.uuid);
+                        await poolManager.resetProviderRefreshStatus(MODEL_PROVIDER.ANTIGRAVITY, this.uuid);
                     }
                 } else {
                     logger.info(`[Antigravity Auth] No access token or refresh token. Starting new authentication flow...`);
@@ -842,7 +939,7 @@ export class AntigravityApiService {
                     // 认证成功，重置状态
                     const poolManager = getProviderPoolManager();
                     if (poolManager && this.uuid) {
-                        poolManager.resetProviderRefreshStatus(MODEL_PROVIDER.ANTIGRAVITY, this.uuid);
+                        await poolManager.resetProviderRefreshStatus(MODEL_PROVIDER.ANTIGRAVITY, this.uuid);
                     }
                 }
             } catch (error) {
@@ -926,82 +1023,87 @@ export class AntigravityApiService {
         }
     }
 
-    async discoverProjectAndModels() {
-        if (this.projectId) {
-            logger.info(`[Antigravity] Using pre-configured Project ID: ${this.projectId}`);
-            return this.projectId;
-        }
-
+    async discoverProjectAndModels(preferredProjectId = '') {
         logger.info('[Antigravity] Discovering Project ID...');
         try {
-            const initialProjectId = "";
-            // Prepare client metadata
+            const initialProjectId = this.resolveProjectId(preferredProjectId);
             const clientMetadata = {
-                ideType: "IDE_UNSPECIFIED",
-                platform: "PLATFORM_UNSPECIFIED",
-                pluginType: "GEMINI",
-                duetProject: initialProjectId,
+                ideType: 'ANTIGRAVITY',
             };
 
-            // Call loadCodeAssist to discover the actual project ID
-            const loadRequest = {
-                cloudaicompanionProject: initialProjectId,
+            await this.callApi('cascadeNuxes', undefined, false, 0, 0, {
+                httpMethod: 'GET',
+                endpointStyle: 'path',
+            });
+            this.userInfo = await this.callApi('fetchUserInfo', {});
+            this.accountEmail = this.resolveAccountEmail(this.userInfo);
+
+            const bootstrapResponse = await this.callApi('loadCodeAssist', {
                 metadata: clientMetadata,
-            };
+            });
 
-            const loadResponse = await this.callApi('loadCodeAssist', loadRequest);
+            let discoveredProjectId = initialProjectId || this.resolveProjectId(bootstrapResponse.cloudaicompanionProject);
 
-            // Check if we already have a project ID from the response
-            if (loadResponse.cloudaicompanionProject) {
-                logger.info(`[Antigravity] Discovered existing Project ID: ${loadResponse.cloudaicompanionProject}`);
-                // 获取可用模型
-                await this.fetchAvailableModels();
-                return loadResponse.cloudaicompanionProject;
+            if (!discoveredProjectId) {
+                const defaultTier = bootstrapResponse.allowedTiers?.find(tier => tier.isDefault);
+                const tierId = defaultTier?.id || 'free-tier';
+
+                const onboardRequest = {
+                    tierId: tierId,
+                    cloudaicompanionProject: initialProjectId,
+                    metadata: clientMetadata,
+                };
+
+                let lroResponse = await this.callApi('onboardUser', onboardRequest);
+
+                // Poll until operation is complete with timeout protection
+                const MAX_RETRIES = 30; // Maximum number of retries (60 seconds total)
+                let retryCount = 0;
+
+                while (!lroResponse.done && retryCount < MAX_RETRIES) {
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    lroResponse = await this.callApi('onboardUser', onboardRequest);
+                    retryCount++;
+                }
+
+                if (!lroResponse.done) {
+                    throw new Error('Onboarding timeout: Operation did not complete within expected time.');
+                }
+
+                discoveredProjectId = this.resolveProjectId(lroResponse.response?.cloudaicompanionProject) || initialProjectId;
+                logger.info(`[Antigravity] Onboarded and discovered Project ID: ${discoveredProjectId}`);
+            } else {
+                logger.info(`[Antigravity] Discovered existing Project ID: ${discoveredProjectId}`);
             }
 
-            // If no existing project, we need to onboard
-            const defaultTier = loadResponse.allowedTiers?.find(tier => tier.isDefault);
-            const tierId = defaultTier?.id || 'free-tier';
+            this.projectId = discoveredProjectId;
 
-            const onboardRequest = {
-                tierId: tierId,
-                cloudaicompanionProject: initialProjectId,
+            await this.callApi('loadCodeAssist', {
+                cloudaicompanionProject: discoveredProjectId,
                 metadata: clientMetadata,
-            };
+            });
 
-            let lroResponse = await this.callApi('onboardUser', onboardRequest);
+            await Promise.all([
+                this.fetchAvailableModels(discoveredProjectId),
+                this.fetchAdminControls(discoveredProjectId),
+            ]);
 
-            // Poll until operation is complete with timeout protection
-            const MAX_RETRIES = 30; // Maximum number of retries (60 seconds total)
-            let retryCount = 0;
-
-            while (!lroResponse.done && retryCount < MAX_RETRIES) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                lroResponse = await this.callApi('onboardUser', onboardRequest);
-                retryCount++;
-            }
-
-            if (!lroResponse.done) {
-                throw new Error('Onboarding timeout: Operation did not complete within expected time.');
-            }
-
-            const discoveredProjectId = lroResponse.response?.cloudaicompanionProject?.id || initialProjectId;
-            logger.info(`[Antigravity] Onboarded and discovered Project ID: ${discoveredProjectId}`);
-            // 获取可用模型
-            await this.fetchAvailableModels();
             return discoveredProjectId;
         } catch (error) {
             logger.error('[Antigravity] Failed to discover Project ID:', error.response?.data || error.message);
             logger.info('[Antigravity] Falling back to generated Project ID as last resort...');
             const fallbackProjectId = generateProjectID();
             logger.info(`[Antigravity] Generated fallback Project ID: ${fallbackProjectId}`);
-            // 获取可用模型
-            await this.fetchAvailableModels();
+            this.projectId = fallbackProjectId;
+            await Promise.all([
+                this.fetchAvailableModels(fallbackProjectId),
+                this.fetchAdminControls(fallbackProjectId),
+            ]);
             return fallbackProjectId;
         }
     }
 
-    async fetchAvailableModels() {
+    async fetchAvailableModels(projectId = this.projectId) {
         logger.info('[Antigravity] Fetching available models...');
 
         for (const baseURL of this.baseURLs) {
@@ -1015,13 +1117,14 @@ export class AntigravityApiService {
                         'User-Agent': this.userAgent
                     },
                     responseType: 'json',
-                    body: JSON.stringify({})
+                    body: JSON.stringify(projectId ? { project: projectId } : {})
                 };
 
                 const res = await this.authClient.request(requestOptions);
                 // logger.info(`[Antigravity] Raw response from ${baseURL}:`, Object.keys(res.data.models));
                 if (res.data && res.data.models) {
                     const models = Object.keys(res.data.models);
+                    this.persistQuotaState(res.data.models);
                     this.availableModels = models
                         .map(modelName2Alias)
                         .filter(alias => alias !== undefined && alias !== '' && alias !== null)
@@ -1037,6 +1140,19 @@ export class AntigravityApiService {
 
         logger.warn('[Antigravity] Failed to fetch models from all endpoints. Using default models.');
         this.availableModels = ANTIGRAVITY_MODELS;
+    }
+
+    async fetchAdminControls(projectId = this.projectId) {
+        if (!projectId) {
+            return null;
+        }
+
+        try {
+            return await this.callApi('fetchAdminControls', { project: projectId });
+        } catch (error) {
+            logger.warn('[Antigravity] Failed to fetch admin controls:', error.message);
+            return null;
+        }
     }
 
     async listModels() {
@@ -1077,7 +1193,7 @@ export class AntigravityApiService {
         return { models: formattedModels };
     }
 
-    async callApi(method, body, isRetry = false, retryCount = 0, baseURLIndex = 0) {
+    async callApi(method, body, isRetry = false, retryCount = 0, baseURLIndex = 0, requestConfig = {}) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
 
@@ -1086,18 +1202,28 @@ export class AntigravityApiService {
         }
 
         const baseURL = this.baseURLs[baseURLIndex];
+        const httpMethod = requestConfig.httpMethod || 'POST';
+        const endpointStyle = requestConfig.endpointStyle === 'path' ? 'path' : 'rpc';
+        const endpoint = endpointStyle === 'path'
+            ? `${ANTIGRAVITY_API_VERSION}/${method}`
+            : `${ANTIGRAVITY_API_VERSION}:${method}`;
 
         try {
             const requestOptions = {
-                url: `${baseURL}/${ANTIGRAVITY_API_VERSION}:${method}`,
-                method: 'POST',
+                url: `${baseURL}/${endpoint}`,
+                method: httpMethod,
                 headers: {
-                    'Content-Type': 'application/json',
                     'User-Agent': this.userAgent
                 },
-                responseType: 'json',
-                body: JSON.stringify(body)
+                responseType: 'json'
             };
+
+            if (httpMethod !== 'GET') {
+                requestOptions.headers['Content-Type'] = 'application/json';
+            }
+            if (body !== undefined && httpMethod !== 'GET') {
+                requestOptions.body = JSON.stringify(body);
+            }
 
             const res = await this.authClient.request(requestOptions);
             return res.data;
@@ -1131,14 +1257,15 @@ export class AntigravityApiService {
             }
 
             if (status === 429) {
+                await this.triggerQuotaRefresh('429');
                 if (baseURLIndex + 1 < this.baseURLs.length) {
                     logger.info(`[Antigravity API] Rate limited on ${baseURL}. Trying next base URL...`);
-                    return this.callApi(method, body, isRetry, retryCount, baseURLIndex + 1);
+                    return this.callApi(method, body, isRetry, retryCount, baseURLIndex + 1, requestConfig);
                 } else if (retryCount < maxRetries) {
                     const delay = baseDelay * Math.pow(2, retryCount);
                     logger.info(`[Antigravity API] Rate limited. Retrying in ${delay}ms...`);
                     await new Promise(resolve => setTimeout(resolve, delay));
-                    return this.callApi(method, body, isRetry, retryCount + 1, 0);
+                    return this.callApi(method, body, isRetry, retryCount + 1, 0, requestConfig);
                 }
             }
 
@@ -1147,13 +1274,13 @@ export class AntigravityApiService {
                 if (baseURLIndex + 1 < this.baseURLs.length) {
                     const errorIdentifier = errorCode || errorMessage.substring(0, 50);
                     logger.info(`[Antigravity API] Network error (${errorIdentifier}) on ${baseURL}. Trying next base URL...`);
-                    return this.callApi(method, body, isRetry, retryCount, baseURLIndex + 1);
+                    return this.callApi(method, body, isRetry, retryCount, baseURLIndex + 1, requestConfig);
                 } else if (retryCount < maxRetries) {
                     const delay = baseDelay * Math.pow(2, retryCount);
                     const errorIdentifier = errorCode || errorMessage.substring(0, 50);
                     logger.info(`[Antigravity API] Network error (${errorIdentifier}). Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
                     await new Promise(resolve => setTimeout(resolve, delay));
-                    return this.callApi(method, body, isRetry, retryCount + 1, 0);
+                    return this.callApi(method, body, isRetry, retryCount + 1, 0, requestConfig);
                 }
             }
 
@@ -1161,7 +1288,7 @@ export class AntigravityApiService {
                 const delay = baseDelay * Math.pow(2, retryCount);
                 logger.info(`[Antigravity API] Server error ${status}. Retrying in ${delay}ms...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
-                return this.callApi(method, body, isRetry, retryCount + 1, baseURLIndex);
+                return this.callApi(method, body, isRetry, retryCount + 1, baseURLIndex, requestConfig);
             }
 
             throw error;
@@ -1233,6 +1360,7 @@ export class AntigravityApiService {
             }
 
             if (status === 429) {
+                await this.triggerQuotaRefresh('stream 429');
                 if (baseURLIndex + 1 < this.baseURLs.length) {
                     logger.info(`[Antigravity API] Rate limited on ${baseURL}. Trying next base URL...`);
                     yield* this.streamApi(method, body, isRetry, retryCount, baseURLIndex + 1);
@@ -1352,7 +1480,7 @@ export class AntigravityApiService {
         }
 
         const response = await this.callApi('generateContent', payload);
-        return toGeminiApiResponse(response.response);
+        return toGeminiApiResponse(response);
     }
 
     /**
@@ -1375,7 +1503,7 @@ export class AntigravityApiService {
             // 将流式响应转换为非流式响应
             const streamData = chunks.join('\n');
             const nonStreamResponse = convertStreamToNonStream(streamData);
-            return toGeminiApiResponse(nonStreamResponse.response);
+            return toGeminiApiResponse(nonStreamResponse);
         } catch (error) {
             logger.error('[Antigravity] Claude non-stream execution error:', error.message);
             throw error;
@@ -1423,7 +1551,7 @@ export class AntigravityApiService {
 
         const stream = this.streamApi('streamGenerateContent', payload);
         for await (const chunk of stream) {
-            yield toGeminiApiResponse(chunk.response);
+            yield toGeminiApiResponse(chunk);
         }
     }
 
@@ -1473,6 +1601,8 @@ export class AntigravityApiService {
                 lastUpdated: Date.now(),
                 models: {}
             };
+            let lastFetchError = null;
+            let fetchedAnyQuotaSource = false;
 
             // 调用 fetchAvailableModels 接口获取模型和配额信息
             for (const baseURL of this.baseURLs) {
@@ -1492,9 +1622,11 @@ export class AntigravityApiService {
                     const res = await this.authClient.request(requestOptions);
                     // logger.info(`[Antigravity] fetchAvailableModels success: ${JSON.stringify(res.data)}`);
                     if (res.data) {
+                        fetchedAnyQuotaSource = true;
 
                         if (res.data.models) {
                             const modelsData = res.data.models;
+                            this.persistQuotaState(modelsData);
                             
                             // 遍历模型数据，提取配额信息
                             for (const [modelId, modelData] of Object.entries(modelsData)) {
@@ -1528,8 +1660,13 @@ export class AntigravityApiService {
                         break; // 成功获取后退出循环
                     }
                 } catch (error) {
+                    lastFetchError = error;
                     logger.error(`[Antigravity] Failed to fetch models with quotas from ${baseURL}:`, error.message);
                 }
+            }
+
+            if (!fetchedAnyQuotaSource && lastFetchError) {
+                throw new Error(`Failed to fetch models with quotas: ${lastFetchError.message}`);
             }
 
             return result;

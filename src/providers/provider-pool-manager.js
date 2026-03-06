@@ -1,11 +1,12 @@
 import * as fs from 'fs';
-import { getServiceAdapter, getRegisteredProviders } from './adapter.js';
+import { destroyAgent, getServiceAdapter, getRegisteredProviders } from './adapter.js';
 import logger from '../utils/logger.js';
 import { MODEL_PROVIDER, getProtocolPrefix } from '../utils/common.js';
 import { getProviderModels } from './provider-models.js';
 import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { convertData } from '../convert/convert.js';
 import { ENDPOINT_TYPE } from '../utils/common.js';
+import { materializeAntigravityProxyLease } from '../services/antigravity-proxy-materializer.js';
 
 /**
  * Manages a pool of API service providers, handling their health and selection.
@@ -75,8 +76,183 @@ export class ProviderPoolManager {
         
         // 用于并发选点时的原子排序辅助（自增序列）
         this._selectionSequence = 0;
+        this.tlsMinSwitchGapMs = this.globalConfig.TLS_MIN_SWITCH_GAP_MS ?? 30000;
+        this.tlsMaxNewSessionsPerMinute = this.globalConfig.TLS_MAX_NEW_SESSIONS_PER_MIN ?? 5;
+        this._antigravityLastSelectionByHost = new Map();
+        this._antigravitySessionTimestamps = [];
  
         this.initializeProviderStatus();
+    }
+
+    async _sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    _isAntigravityProvider(providerType) {
+        return providerType === MODEL_PROVIDER.ANTIGRAVITY;
+    }
+
+    _hasAntigravityTlsProxy(providerStatus) {
+        const proxyUrl = providerStatus?.config?.PROXY_URL;
+        return typeof proxyUrl === 'string' && proxyUrl.trim().length > 0;
+    }
+
+    _hasAntigravityIpoasisConfig(providerStatus) {
+        const subuserId = providerStatus?.config?.IPOASIS_SUBUSER_ID;
+        return Number.isFinite(Number(subuserId)) && Number(subuserId) > 0;
+    }
+
+    _isProviderOperational(providerType, providerStatus) {
+        if (!providerStatus?.config) {
+            return false;
+        }
+
+        if (!providerStatus.config.isHealthy || providerStatus.config.isDisabled || providerStatus.config.needsRefresh) {
+            return false;
+        }
+
+        if (this._isAntigravityProvider(providerType) && !this._hasAntigravityTlsProxy(providerStatus)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    _supportsRequestedModel(providerStatus, requestedModel) {
+        if (!requestedModel) {
+            return true;
+        }
+
+        if (!providerStatus?.config?.notSupportedModels || !Array.isArray(providerStatus.config.notSupportedModels)) {
+            return true;
+        }
+
+        return !providerStatus.config.notSupportedModels.includes(requestedModel);
+    }
+
+    _canServeSelection(providerType, providerStatus, requestedModel = null) {
+        return this._isProviderOperational(providerType, providerStatus)
+            && this._supportsRequestedModel(providerStatus, requestedModel);
+    }
+
+    _getAntigravityHostKey(providerConfig) {
+        return providerConfig?.HOST || this.globalConfig?.HOST || 'default-antigravity-host';
+    }
+
+    _pruneAntigravitySessionTimestamps(now) {
+        const cutoff = now - 60 * 1000;
+        this._antigravitySessionTimestamps = this._antigravitySessionTimestamps.filter(timestamp => timestamp > cutoff);
+    }
+
+    async _enforceAntigravityTlsLimits(providerConfig) {
+        if (!providerConfig?.uuid) {
+            return;
+        }
+
+        const hostKey = this._getAntigravityHostKey(providerConfig);
+        const lastSelection = this._antigravityLastSelectionByHost.get(hostKey) || null;
+        const switchingAccounts = Boolean(lastSelection && lastSelection.uuid !== providerConfig.uuid);
+
+        if (switchingAccounts && this.tlsMinSwitchGapMs > 0) {
+            const waitMs = this.tlsMinSwitchGapMs - (Date.now() - lastSelection.at);
+            if (waitMs > 0) {
+                this._log('info', `[TLS Isolation] Waiting ${waitMs}ms before switching ${hostKey} from ${lastSelection.uuid} to ${providerConfig.uuid}`);
+                await this._sleep(waitMs);
+            }
+        }
+
+        if ((!lastSelection || switchingAccounts) && this.tlsMaxNewSessionsPerMinute > 0) {
+            this._pruneAntigravitySessionTimestamps(Date.now());
+            if (this._antigravitySessionTimestamps.length >= this.tlsMaxNewSessionsPerMinute) {
+                const earliestTimestamp = this._antigravitySessionTimestamps[0];
+                const waitMs = Math.max(0, (60 * 1000) - (Date.now() - earliestTimestamp));
+                if (waitMs > 0) {
+                    this._log('info', `[TLS Isolation] Waiting ${waitMs}ms for Antigravity TLS session budget`);
+                    await this._sleep(waitMs);
+                }
+                this._pruneAntigravitySessionTimestamps(Date.now());
+            }
+
+            this._antigravitySessionTimestamps.push(Date.now());
+        }
+
+        this._antigravityLastSelectionByHost.set(hostKey, {
+            uuid: providerConfig.uuid,
+            at: Date.now(),
+        });
+    }
+
+    _cleanupProviderResources(providerType, providerConfig, reason = 'lifecycle change') {
+        if (!this._isAntigravityProvider(providerType) || !providerConfig?.uuid) {
+            return;
+        }
+
+        try {
+            destroyAgent(providerConfig.uuid);
+            this._log('info', `[TLS Isolation] Destroyed cached Antigravity agent for ${providerConfig.uuid} (${reason})`);
+        } catch (error) {
+            this._log('warn', `[TLS Isolation] Failed to destroy cached Antigravity agent for ${providerConfig.uuid}: ${error.message}`);
+        }
+    }
+
+    transitionProviderLifecycleState(providerType, providerConfig, nextState) {
+        if (!providerConfig?.uuid) {
+            this._log('error', 'Invalid providerConfig in transitionProviderLifecycleState');
+            return;
+        }
+
+        const provider = this._findProvider(providerType, providerConfig.uuid);
+        if (!provider) {
+            return;
+        }
+
+        provider.config.lifecycleState = nextState;
+        if (['quarantined', 'quarantine', 'cooldown', 'removed', 'removal'].includes(nextState)) {
+            this._cleanupProviderResources(providerType, provider.config, nextState);
+        }
+        this._debouncedSave(providerType);
+    }
+
+    _validateAntigravityProxyConfiguration(providerType) {
+        if (!this._isAntigravityProvider(providerType)) {
+            return;
+        }
+
+        const enabledProviders = (this.providerStatus[providerType] || [])
+            .filter(providerStatus => !providerStatus?.config?.isDisabled);
+        const missingSubuserProviders = enabledProviders
+            .filter(providerStatus => !this._hasAntigravityIpoasisConfig(providerStatus))
+            .map(providerStatus => providerStatus.config?.customName || providerStatus.config?.uuid || providerStatus.uuid || 'unknown');
+        const manualProxyProviders = enabledProviders
+            .filter(providerStatus => providerStatus?.config?.PROXY_URL && providerStatus?.config?.RUNTIME_PROXY_URL_SOURCE !== 'ipoasis')
+            .map(providerStatus => providerStatus.config?.customName || providerStatus.config?.uuid || providerStatus.uuid || 'unknown');
+        const missingRuntimeProxyProviders = enabledProviders
+            .filter(providerStatus => !this._hasAntigravityTlsProxy(providerStatus))
+            .map(providerStatus => providerStatus.config?.customName || providerStatus.config?.uuid || providerStatus.uuid || 'unknown');
+
+        if (missingSubuserProviders.length > 0) {
+            const error = new Error(
+                `[Startup Validation] Antigravity accounts missing required IPOASIS_SUBUSER_ID: ${missingSubuserProviders.join(', ')}`
+            );
+            this._log('error', error.message);
+            throw error;
+        }
+
+        if (manualProxyProviders.length > 0) {
+            const error = new Error(
+                `[Startup Validation] Antigravity accounts must not define manual PROXY_URL: ${manualProxyProviders.join(', ')}`
+            );
+            this._log('error', error.message);
+            throw error;
+        }
+
+        if (missingRuntimeProxyProviders.length > 0) {
+            const error = new Error(
+                `[Startup Validation] Antigravity accounts missing runtime IPOasis proxy lease: ${missingRuntimeProxyProviders.join(', ')}`
+            );
+            this._log('error', error.message);
+            throw error;
+        }
     }
 
     /**
@@ -112,7 +288,19 @@ export class ProviderPoolManager {
 
                 if (configPath && fs.existsSync(configPath)) {
                     try {
-                        if (true) {
+                        const nodeConfig = {
+                            ...this.globalConfig,
+                            ...config,
+                            MODEL_PROVIDER: providerType,
+                        };
+                        delete nodeConfig.providerPools;
+
+                        const adapter = getServiceAdapter(nodeConfig);
+                        const isNearExpiry = typeof adapter?.isExpiryDateNear === 'function'
+                            ? adapter.isExpiryDateNear() === true
+                            : false;
+
+                        if (isNearExpiry) {
                             this._log('warn', `Node ${providerStatus.uuid} (${providerType}) is near expiration. Enqueuing refresh...`);
                             this._enqueueRefresh(providerType, providerStatus);
                         }
@@ -647,6 +835,7 @@ export class ProviderPoolManager {
                     }
                 });
             });
+            this._validateAntigravityProxyConfiguration(providerType);
         }
         this._log('info', `Initialized provider statuses: ok (maxErrorCount: ${this.maxErrorCount})`);
     }
@@ -675,6 +864,12 @@ export class ProviderPoolManager {
 
         // 如果没有限制，直接增加活跃计数并返回
         if (concurrencyLimit <= 0) {
+            const refreshedProvider = this._findProvider(providerType, config.uuid);
+            if (!this._canServeSelection(providerType, refreshedProvider, requestedModel)) {
+                this._log('info', `[Concurrency] Node ${config.uuid} became unavailable while queued, reselecting provider`);
+                return this.acquireSlot(providerType, requestedModel, options);
+            }
+
             state.activeCount++;
             return config;
         }
@@ -711,6 +906,18 @@ export class ProviderPoolManager {
                 });
             } finally {
                 state.waitingCount--;
+            }
+
+            const currentProvider = this._findProvider(providerType, config.uuid);
+            const currentConfig = currentProvider?.config || config;
+            const stillSelectable = currentConfig?.isHealthy
+                && !currentConfig?.isDisabled
+                && !currentConfig?.needsRefresh
+                && (!this._isAntigravityProvider(providerType) || this._hasAntigravityTlsProxy(currentProvider || { config: currentConfig }));
+
+            if (!stillSelectable) {
+                this._log('info', `[Concurrency] Node ${config.uuid} became unavailable while queued. Re-selecting...`);
+                return this.acquireSlot(providerType, requestedModel, options);
             }
 
             // 获得信号后，增加活跃计数
@@ -778,7 +985,13 @@ export class ProviderPoolManager {
         
         try {
             // 在锁内部执行同步选择
-            return this._doSelectProvider(providerType, requestedModel, options);
+            const selectedConfig = this._doSelectProvider(providerType, requestedModel, options);
+            if (selectedConfig && this._isAntigravityProvider(providerType)) {
+                await this._enforceAntigravityTlsLimits(selectedConfig);
+                selectedConfig.lastUsed = new Date().toISOString();
+                this._debouncedSave(providerType);
+            }
+            return selectedConfig;
         } finally {
             this._isSelecting[providerType] = false;
         }
@@ -798,8 +1011,17 @@ export class ProviderPoolManager {
         const now = Date.now();
         
         let availableAndHealthyProviders = availableProviders.filter(p =>
-            p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh
+            this._isProviderOperational(providerType, p)
         );
+
+        if (this._isAntigravityProvider(providerType)) {
+            const missingProxyProviders = availableProviders.filter(p =>
+                p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh && !this._hasAntigravityTlsProxy(p)
+            );
+            if (missingProxyProviders.length > 0) {
+                this._log('warn', 'Antigravity accounts require runtime IPOasis proxy leases for TLS isolation');
+            }
+        }
 
         // 如果指定了模型，则排除不支持该模型的提供商
         if (requestedModel) {
@@ -828,7 +1050,16 @@ export class ProviderPoolManager {
 
         // 改进：使用统一的评分策略进行选择
         // 传入当前时间戳 now 确保一致性
-        const selected = availableAndHealthyProviders.sort((a, b) => {
+        const preferredProvider = options.preSelectedUuid
+            ? availableAndHealthyProviders.find(p => p.uuid === options.preSelectedUuid) || null
+            : null;
+        if (preferredProvider) {
+            this._log('debug', `Selected provider for ${providerType} via preSelectedUuid: ${preferredProvider.uuid}`);
+        } else if (options.preSelectedUuid) {
+            this._log('debug', `preSelectedUuid ${options.preSelectedUuid} not available for ${providerType}, falling back to score-based selection`);
+        }
+
+        const selected = preferredProvider || availableAndHealthyProviders.sort((a, b) => {
             const scoreA = this._calculateNodeScore(a, now);
             const scoreB = this._calculateNodeScore(b, now);
             if (scoreA !== scoreB) return scoreA - scoreB;
@@ -1385,6 +1616,7 @@ export class ProviderPoolManager {
             }
 
             this._log('warn', `Immediately marked provider as unhealthy: ${providerConfig.uuid} for type ${providerType}. Reason: ${errorMessage || 'Authentication error'}`);
+            this._cleanupProviderResources(providerType, provider.config, 'immediate unhealthy');
            
             this._debouncedSave(providerType);
         }
@@ -1423,6 +1655,8 @@ export class ProviderPoolManager {
             } else {
                 this._log('warn', `Marked provider as unhealthy: ${providerConfig.uuid} for type ${providerType}. Reason: ${errorMessage || 'Quota exhausted'}`);
             }
+
+            this._cleanupProviderResources(providerType, provider.config, 'scheduled recovery');
 
             this._debouncedSave(providerType);
         }
@@ -1483,7 +1717,7 @@ export class ProviderPoolManager {
      * @param {string} providerType - 提供商类型
      * @param {string} uuid - 提供商 UUID
      */
-    resetProviderRefreshStatus(providerType, uuid) {
+    async resetProviderRefreshStatus(providerType, uuid) {
         if (!providerType || !uuid) {
             this._log('error', 'Invalid parameters in resetProviderRefreshStatus');
             return;
@@ -1491,11 +1725,18 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, uuid);
         if (provider) {
+            if (this._isAntigravityProvider(providerType) && (!this._hasAntigravityTlsProxy(provider) || provider.config.RUNTIME_PROXY_LEASE_STATE === 'error')) {
+                await materializeAntigravityProxyLease(this.globalConfig, provider.config, { forceGenerate: true });
+            }
+            provider.config.isHealthy = true;
             provider.config.needsRefresh = false;
             provider.config.refreshCount = 0;
-            // 更新为可用
+            provider.config.errorCount = 0;
+            provider.config.lastErrorTime = null;
+            provider.config.lastErrorMessage = null;
+            provider.config.scheduledRecoveryTime = null;
+            provider.config._lastSelectionSeq = 0;
             provider.config.lastHealthCheckTime = new Date().toISOString();
-            // 标记为健康，以便立即投入使用
             this._log('info', `Reset refresh status and marked healthy for provider ${uuid} (${providerType})`);
 
             this._debouncedSave(providerType);
@@ -1539,6 +1780,7 @@ export class ProviderPoolManager {
         if (provider) {
             provider.config.isDisabled = true;
             this._log('info', `Disabled provider: ${providerConfig.uuid} for type ${providerType}`);
+            this._cleanupProviderResources(providerType, provider.config, 'disabled');
             this._debouncedSave(providerType);
         }
     }

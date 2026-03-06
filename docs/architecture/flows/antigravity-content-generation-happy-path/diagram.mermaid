@@ -1,0 +1,52 @@
+flowchart LR
+    start([Client sends content request])
+
+    subgraph api["🧭 API ingress"]
+        direction LR
+        route["POST content endpoint"]
+        normalize["handleContentGenerationRequest"]
+    end
+
+    subgraph pipeline["🪝 Antigravity pipeline"]
+        direction LR
+        prehooks["Execute provider pre-hooks"]
+        selectsvc["getApiServiceWithFallback"]
+        reserve["acquireSlotWithFallback"]
+    end
+
+    subgraph provider["🚀 Antigravity provider"]
+        direction LR
+        convert["Build backend request body"]
+        generate["generateContent / generateContentStream"]
+        success["Record success metadata"]
+    end
+
+    subgraph post["📊 post generation"]
+        direction LR
+        release[(Database: release active slot)]
+        hook["onContentGenerated"]
+        telemetry["Provider post-hooks"]
+        telelog[(Database: upsert telemetry_log)]
+    end
+
+    finish([Client receives final response])
+
+    start --> route
+    route --> normalize
+    normalize --> prehooks
+    prehooks --> selectsvc
+    selectsvc --> reserve
+    reserve --> convert
+    convert --> generate
+    generate --> success
+    success --> release
+    release --> finish
+    finish -.-> hook
+    hook -.-> telemetry
+    telemetry -.-> telelog
+
+    style start fill:#e1f5e1
+    style route fill:#e1f5e1
+    style release fill:#e1f0ff
+    style telelog fill:#e1f0ff
+    style finish fill:#ffe1e1

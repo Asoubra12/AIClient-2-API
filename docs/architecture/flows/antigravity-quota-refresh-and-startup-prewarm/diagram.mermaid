@@ -1,0 +1,38 @@
+flowchart LR
+    start([Startup or refresh trigger])
+
+    subgraph startup["⏱️ startup and scheduler"]
+        direction LR
+        prewarm["prewarmAntigravityAccounts"]
+        sched["scheduleNextRefresh"]
+        run["refreshProviderPool"]
+    end
+
+    subgraph pool["🧱 provider maintenance"]
+        direction LR
+        buffer["Buffer and queue refresh work"]
+        refresh["Refresh node token or initialize"]
+        flag["Mark needsRefresh or restore healthy"]
+    end
+
+    subgraph quota["🗃️ quota state"]
+        direction LR
+        store[(Database: upsert quota_state)]
+    end
+
+    finish([Updated accounts re-enter selection])
+
+    start --> prewarm
+    start --> sched
+    sched -.-> run
+    prewarm --> refresh
+    run --> buffer
+    buffer --> refresh
+    refresh --> flag
+    refresh --> store
+    flag --> finish
+    store --> finish
+
+    style start fill:#e1f5e1
+    style store fill:#e1f0ff
+    style finish fill:#ffe1e1
